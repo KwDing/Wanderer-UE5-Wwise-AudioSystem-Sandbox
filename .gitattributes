@@ -1,0 +1,10 @@
+* text=auto
+*.md text eol=lf
+*.py text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.jpg binary
+*.png binary
+# Assets belong in Diversion; no LFS in the reading edition.

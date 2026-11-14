@@ -1,0 +1,60 @@
+#pragma once
+
+namespace SceneTerrainParameters
+{
+    constexpr float EdgeFadeDistance = 350.0f;
+    constexpr float BroadNoiseScale = 620.0f;
+    constexpr float DetailNoiseScale = 210.0f;
+    constexpr float DetailNoiseOffsetX = 13.0f;
+    constexpr float DetailNoiseOffsetY = 7.0f;
+    constexpr float FineNoiseScale = 90.0f;
+    constexpr float FineNoiseOffsetX = 19.0f;
+    constexpr float FineNoiseOffsetY = 23.0f;
+    constexpr float LakeCenterX = -50.0f;
+    constexpr float LakeCenterY = -8950.0f;
+    constexpr float LakeRadiusX = 1500.0f;
+    constexpr float LakeRadiusY = 1000.0f;
+    constexpr float DryGroundInner = 0.75f;
+    constexpr float LakeOuter = 1.05f;
+    constexpr float BroadAmplitude = 45.0f;
+    constexpr float DetailAmplitude = 28.0f;
+    constexpr float FineAmplitude = 9.0f;
+    constexpr float FountainCenterX = -350.0f;
+    constexpr float FountainCenterY = -4480.0f;
+    constexpr float FountainRadiusX = 850.0f;
+    constexpr float FountainRadiusY = 650.0f;
+    constexpr float FountainInner = 0.7f;
+    constexpr float GrassCenterX = -500.0f;
+    constexpr float GrassCenterY = -5150.0f;
+    constexpr float GrassRadiusX = 1180.0f;
+    constexpr float GrassRadiusY = 760.0f;
+    constexpr float SurfaceMaskInner = 0.72f;
+    constexpr float SnowCenterX = -1250.0f;
+    constexpr float SnowCenterY = -6300.0f;
+    constexpr float SnowRadiusX = 720.0f;
+    constexpr float SandCenterX = 450.0f;
+    constexpr float SandCenterY = -7850.0f;
+    constexpr float SandRadiusX = 900.0f;
+    constexpr float DuneOffsetX = 41.0f;
+    constexpr float DuneScaleY = 480.0f;
+    constexpr float DuneOffsetY = 17.0f;
+    constexpr float SnowNoiseScaleX = 300.0f;
+    constexpr float SnowNoiseOffsetX = 31.0f;
+    constexpr float SnowNoiseScaleY = 420.0f;
+    constexpr float GrassDetailAmplitude = 18.0f;
+    constexpr float SurfaceFineAmplitude = 8.0f;
+    constexpr float SnowDriftAmplitude = 26.0f;
+    constexpr float SnowDetailAmplitude = 11.0f;
+    constexpr float SandDuneAmplitude = 30.0f;
+    constexpr float SoilDetailAmplitude = 16.0f;
+    constexpr float LakeInner = 0.25f;
+    constexpr float LakeDepth = 240.0f;
+    constexpr float HeightEncodingOffset = 32768.0f;
+    constexpr float HeightEncodingScale = 128.0f;
+    constexpr float SandRadiusY = 620.0f;
+    constexpr float SnowRadiusY = 650.0f;
+    constexpr float DuneScaleX = 350.0f;
+    constexpr float SnowNoiseOffsetY = 9.0f;
+    constexpr float SoilFineAmplitude = 9.0f;
+    constexpr int32 MaxEncodedHeight = 65535;
+} // namespace SceneTerrainParameters
