@@ -1,15 +1,11 @@
 #include "Framework/Mapping/WandererMapComponent.h"
 
-#include "Components/CapsuleComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Engine/Level.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
-#include "EngineUtils.h"
 #include "GameFramework/Character.h"
-#include "GameFramework/CharacterMovementComponent.h"
-#include "GameFramework/PlayerController.h"
 #include "GameFramework/Volume.h"
-#include "HAL/PlatformTime.h"
 #include "Materials/MaterialInterface.h"
 
 #include "Core/NaturalSurfaceUtils.h"
@@ -17,15 +13,89 @@
 #include "Data/DemoSurfaceData.h"
 #include "Interfaces/CharacterSurfaceProvider.h"
 
-void UWandererMapComponent::StartSurvey()
+namespace
 {
+    bool IsMapSurveyLevelActive(const ULevel& InLevel, const UWorld& InWorld)
+    {
+        const bool bVisibleOrChanging = (InLevel.bIsVisible && !InLevel.bIsBeingRemoved)
+            || InLevel.bIsAssociatingLevel || InLevel.bIsDisassociatingLevel;
+        const FLevelCollection* Collection = InLevel.GetCachedLevelCollection();
+        const FLevelCollection* Active = InWorld.GetActiveLevelCollection();
+        return bVisibleOrChanging && (!Active || !Collection || Collection == Active
+            || Collection->GetType() == ELevelCollectionType::StaticLevels);
+    }
+}
+
+void UWandererMapComponent::BeginSurveyBounds()
+{
+    VisibleBounds = FBox(ForceInit);
     SurveyBounds = FBox(ForceInit);
     SurveyQuery = FCollisionQueryParams(
         SCENE_QUERY_STAT(WandererMapSurvey), true, ScanCharacterWeakPtr.Get());
     SurveyQuery.bReturnFaceIndex = true;
     SurveyQuery.bReturnPhysicalMaterial = true;
-    FBox VisibleBounds(ForceInit);
-    GatherSurveyBounds(VisibleBounds);
+}
+
+void UWandererMapComponent::AdvanceSurveyBounds()
+{
+    if (AActor* Actor = BoundsActorWeakPtr.Get(); Actor && !Actor->IsActorBeingDestroyed())
+    {
+        const auto& Components = Actor->GetComponents();
+        if (NextComponent < Components.GetMaxIndex())
+        {
+            // Resolve the sparse slot within this step. No container iterator survives the tick.
+            const FSetElementId Id = FSetElementId::FromInteger(NextComponent++);
+            if (Components.IsValidId(Id))
+            {
+                UActorComponent* Component = Components[Id];
+                if (bCollectTrialBounds)
+                {
+                    const auto* Primitive = Cast<UPrimitiveComponent>(Component);
+                    if (Primitive && Primitive->IsRegistered())
+                    {
+                        SurveyBounds += Primitive->Bounds.GetBox();
+                    }
+                }
+                if (auto* Mesh = Cast<UStaticMeshComponent>(Component))
+                {
+                    GatherSurveyMesh(*Mesh);
+                }
+            }
+            return;
+        }
+    }
+    BoundsActorWeakPtr.Reset();
+
+    UWorld* World = GetWorld();
+    const TArray<ULevel*>& Levels = World->GetLevels();
+    if (!Levels.IsValidIndex(NextLevel))
+    {
+        FinalizeSurveyBounds();
+        return;
+    }
+    const ULevel* Level = Levels[NextLevel];
+    if (!IsValid(Level) || !IsMapSurveyLevelActive(*Level, *World) || !Level->Actors.IsValidIndex(NextActor))
+    {
+        ++NextLevel;
+        NextActor = 0;
+        return;
+    }
+    AActor* Actor = Level->Actors[NextActor++];
+    if (IsValid(Actor) && !Actor->IsActorBeingDestroyed() && Actor->GetWorld() == World)
+    {
+        BoundsActorWeakPtr = Actor;
+        NextComponent = 0;
+        bCollectTrialBounds = Actor->ActorHasTag(TEXT("TrialBoundary"));
+        if (Actor->IsHidden() || Actor->IsA<AVolume>() || Actor->IsA<APawn>())
+        {
+            SurveyQuery.AddIgnoredActor(Actor);
+        }
+    }
+}
+
+void UWandererMapComponent::FinalizeSurveyBounds()
+{
+    Phase = EScanPhase::Reachable;
     if (!SurveyBounds.IsValid)
     {
         SurveyBounds = VisibleBounds;
@@ -56,40 +126,29 @@ void UWandererMapComponent::StartSurvey()
     Snapshot.MapBounds += FVector2D(SurveyBounds.Min);
     Snapshot.MapBounds += FVector2D(SurveyBounds.Max);
     Snapshot.bSurveying = SurveyDimensions.X > 0 && SurveyDimensions.Y > 0;
-}
-
-void UWandererMapComponent::GatherSurveyBounds(FBox& OutVisibleBounds)
-{
-    for (TActorIterator<AActor> Actor(GetWorld()); Actor; ++Actor)
+    if (Snapshot.bSurveying)
     {
-        if (Actor->ActorHasTag(TEXT("TrialBoundary")))
-        {
-            SurveyBounds += Actor->GetComponentsBoundingBox(true);
-        }
-        if (Actor->IsHidden() || Actor->IsA<AVolume>() || Actor->IsA<APawn>())
-        {
-            SurveyQuery.AddIgnoredActor(*Actor);
-        }
-        TInlineComponentArray<UStaticMeshComponent*> Components(*Actor);
-        for (UStaticMeshComponent* Component : Components)
-        {
-            GatherSurveyMesh(*Component, OutVisibleBounds);
-        }
+        Phase = EScanPhase::Survey;
     }
 }
 
-void UWandererMapComponent::GatherSurveyMesh(UStaticMeshComponent& InMesh, FBox& OutVisibleBounds)
+void UWandererMapComponent::GatherSurveyMesh(UStaticMeshComponent& InMesh)
 {
+    const UStaticMesh* Mesh = InMesh.GetStaticMesh();
+    const FString Name = Mesh ? Mesh->GetName() : FString();
+    if (Name.Contains(TEXT("Door")))
+    {
+        DoorCandidates.Add(&InMesh);
+    }
     if (!InMesh.IsVisible() || InMesh.bHiddenInGame)
     {
         SurveyQuery.AddIgnoredComponent(&InMesh);
         return;
     }
-    if (!InMesh.GetStaticMesh())
+    if (!Mesh)
     {
         return;
     }
-    const FString Name = InMesh.GetStaticMesh()->GetName();
     if (InMesh.ComponentHasTag(TEXT("WaterSurface")))
     {
         SurveyWater.Add(&InMesh);
@@ -102,7 +161,7 @@ void UWandererMapComponent::GatherSurveyMesh(UStaticMeshComponent& InMesh, FBox&
     }
     else
     {
-        OutVisibleBounds += InMesh.Bounds.GetBox();
+        VisibleBounds += InMesh.Bounds.GetBox();
     }
 }
 

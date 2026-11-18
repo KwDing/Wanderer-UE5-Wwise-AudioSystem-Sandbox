@@ -64,5 +64,5 @@ namespace
             }
         }
     };
-    FCharacterWidgetRegistration Registration;
+    FCharacterWidgetRegistration CharacterWidgetRegistration;
 } // namespace

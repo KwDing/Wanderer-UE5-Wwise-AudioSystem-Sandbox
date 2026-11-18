@@ -1,89 +1,105 @@
 #include "Systems/Audio/RadioPlaybackManager.h"
 
+#include "Engine/AssetManager.h"
+#include "Engine/StreamableManager.h"
 #include "GameFramework/Actor.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/ScopeExit.h"
 
-#include "AkAudioDevice.h"
 #include "AkAudioEvent.h"
 #include "AkComponent.h"
-#include "Wwise/API/WwiseSoundEngineAPI.h"
 
 #include "Core/Diagnostics/DiagnosticRecorder.h"
 #include "Core/Diagnostics/DiagnosticTraceScope.h"
+#include "Data/Audio/WandererRadioAudioSettings.h"
+#include "Systems/Audio/AudioEmitterPool.h"
+#include "Systems/Audio/AudioEventLeaseManager.h"
 #include "Systems/Audio/RadioChannelLayout.h"
+#include "Systems/Audio/WwiseAudioBackend.h"
 
 namespace RadioPlaybackDefaults
 {
     constexpr int32 ContentGroupCountMax = 4;
+    constexpr double MediaTimeoutSec = 15.0;
     constexpr int32 TransitionMs = 50;
     constexpr float EmitterUpdateIntervalSec = 0.05f;
 } // namespace RadioPlaybackDefaults
 
-DEFINE_LOG_CATEGORY_STATIC(LogWandererRecorder, Log, All);
+DEFINE_LOG_CATEGORY_STATIC(LogWandererRadioPlayback, Log, All);
 
-const ANSICHAR* URadioPlaybackManager::ResolveRadioSwitch(FName InContentID)
+TOptional<ERadioContent> URadioPlaybackManager::ResolveRadioContent(FName InContentID)
 {
     if (InContentID == TEXT("RECORDER_SONG_DEFAULT"))
     {
-        return "Song";
+        return ERadioContent::Song;
     }
     if (InContentID == TEXT("RECORDER_NOISE"))
     {
-        return "Noise";
+        return ERadioContent::Noise;
     }
     if (InContentID == TEXT("RECORDER_TAPE_HISS"))
     {
-        return "Hiss";
+        return ERadioContent::Hiss;
     }
-    return nullptr;
+    return {};
 }
 
-int32 URadioPlaybackManager::GetChannelMask(
+ERadioChannel URadioPlaybackManager::GetChannel(
     int32 InNumber, FName InContentID, const TArray<FRadioEmitterSnapshot>& InSources) const
 {
     const FRadioSyncGroup* Group = FindSyncGroup(InContentID);
     return FRadioChannelLayout(InSources, InContentID, !Group || Group->bStereo)
-        .GetChannelMask(InNumber - 1);
+        .GetChannel(InNumber - 1);
 }
 
 int32 URadioPlaybackManager::GetPosition(int32 InNumber, FName InContentID) const
 {
     const FRadioSyncGroup* Group = FindSyncGroup(InContentID);
-    const int32 Slot = InNumber - 1;
-    IWwiseSoundEngineAPI* Engine = IWwiseSoundEngineAPI::Get();
-    AkTimeMs Position = 0;
-    if (!Group || !Group->PlayingIDs.IsValidIndex(Slot) || !FAkAudioDevice::IsInitialized()
-        || !Engine)
+    if (InNumber <= 0 || InNumber > FRadioChannelLayout::SlotCount)
     {
         return -1;
     }
-    return Engine->GetSourcePlayPosition(Group->PlayingIDs[Slot], &Position, false) == AK_Success
-               ? Position
-               : -1;
+    const int32 PositionMs = Group
+        ? WandererAudioBackend::GetPlaybackPositionMs(Group->PlayingID) : -1;
+    const int32* Saved = SavedPositionsMs.Find(InContentID);
+    return PositionMs >= 0 ? PositionMs : Saved ? *Saved : -1;
 }
 
 bool URadioPlaybackManager::HasContent(FName InContentID) const
 {
-    return FindSyncGroup(InContentID) != nullptr;
+    return FindSyncGroup(InContentID) != nullptr || SavedPositionsMs.Contains(InContentID);
 }
 
-bool URadioPlaybackManager::Initialize(AActor* InOwner)
+ERadioPlaybackPhase URadioPlaybackManager::GetPlaybackPhase(FName InContentID) const
 {
+    if (PendingStarts.Contains(InContentID))
+    {
+        return MediaStatus == EAudioEventResourceStatus::Ready
+            ? ERadioPlaybackPhase::WaitingForEmitters : ERadioPlaybackPhase::LoadingMedia;
+    }
+    if (FindSyncGroup(InContentID))
+    {
+        return bWaitingForListener ? ERadioPlaybackPhase::WaitingForListener
+                                   : ERadioPlaybackPhase::Ready;
+    }
+    return ERadioPlaybackPhase::Stopped;
+}
+
+bool URadioPlaybackManager::Initialize(AActor* InOwner, UAudioEmitterPool& InPool)
+{
+    if (!IsValid(InOwner) || bShuttingDown)
+    {
+        return false;
+    }
     bOperationActive = true;
     ON_SCOPE_EXIT
     {
         FinishOperation();
     };
     OwnerWeakPtr = InOwner;
-    PlayRadioEvent = LoadObject<UAkAudioEvent>(
-        nullptr, TEXT("/Game/WwiseAudio/Events/Objects/Play_Radio.Play_Radio"));
-    if (bShuttingDown)
-    {
-        return false;
-    }
-    StopRadioEvent = LoadObject<UAkAudioEvent>(
-        nullptr, TEXT("/Game/WwiseAudio/Events/Objects/Stop_Radio.Stop_Radio"));
-    SyncGroups.Reserve(FRadioChannelLayout::SlotCount);
+    EmitterPoolWeakPtr = &InPool;
+    SyncGroups.Reserve(RadioPlaybackDefaults::ContentGroupCountMax);
+    RequestMedia();
     return !bShuttingDown;
 }
 
@@ -114,13 +130,33 @@ bool URadioPlaybackManager::Start(
         FinishOperation();
     };
     Sources = InSources;
-    const bool bStarted = FindSyncGroup(InContentID) || CreateSyncGroup(InContentID);
+    if (!ResolveRadioContent(InContentID).IsSet())
+    {
+        OutStatus = TEXT("Unknown radio content.");
+        return false;
+    }
+    if (!bResourcesRequested || MediaStatus == EAudioEventResourceStatus::Failed)
+    {
+        RequestMedia();
+    }
+    if (MediaStatus == EAudioEventResourceStatus::Pending)
+    {
+        PendingStarts.Add(InContentID);
+        OutStatus = TEXT("Loading radio audio.");
+        return true;
+    }
+    const EGroupStart Result = FindSyncGroup(InContentID)
+        ? EGroupStart::Started : CreateSyncGroup(InContentID);
+    if (Result == EGroupStart::WaitingForEmitters)
+    {
+        PendingStarts.Add(InContentID);
+    }
     OutStatus = Status;
-    return bStarted && !bShuttingDown;
+    return Result != EGroupStart::Failed && !bShuttingDown;
 }
 
 bool URadioPlaybackManager::Update(
-    const TArray<FRadioEmitterSnapshot>& InSources, float InDeltaTime, TArray<FName>& OutFailed)
+    const TArray<FRadioEmitterSnapshot>& InSources, float, TArray<FName>& OutFailed)
 {
     if (bShuttingDown || bOperationActive || !OwnerWeakPtr.IsValid())
     {
@@ -132,40 +168,258 @@ bool URadioPlaybackManager::Update(
         FinishOperation();
     };
     Sources = InSources;
-    FAkAudioDevice* Device = FAkAudioDevice::Get();
-    UAkComponent* Listener = Device ? Device->GetSpatialAudioListener() : nullptr;
-    const bool bAvailable = FAkAudioDevice::IsInitialized() && IsValid(Listener)
-                            && Listener->GetWorld() == OwnerWeakPtr->GetWorld();
+    if (Sources.IsEmpty())
+    {
+        ParkPlayback();
+        return !bShuttingDown;
+    }
+    if (!bResourcesRequested && bWithinLoadRange)
+    {
+        RequestMedia();
+    }
+    if (bWithinLoadRange)
+    {
+        AdvanceMedia();
+        UpdatePendingStarts(OutFailed);
+    }
+    else if (bHasSpatialSample && SyncGroups.IsEmpty())
+    {
+        ReleaseMedia();
+        bResourcesRequested = false;
+        MediaStatus = EAudioEventResourceStatus::Pending;
+    }
+    AActor* Owner = OwnerWeakPtr.Get();
+    if (bShuttingDown || !Owner)
+    {
+        return false;
+    }
+
+    const bool bHasListener = WandererAudioBackend::HasSpatialListener(Owner->GetWorld());
+    const bool bMuteForMissingListener = !bHasListener && !bWaitingForListener;
+    bWaitingForListener = !bHasListener;
     for (int32 Index = SyncGroups.Num() - 1; Index >= 0; --Index)
     {
-        if (bAvailable && UpdateSyncGroup(SyncGroups[Index], InDeltaTime))
+        FRadioSyncGroup& Group = SyncGroups[Index];
+        const int32 PositionMs = WandererAudioBackend::GetPlaybackPositionMs(Group.PlayingID);
+        if (PositionMs >= 0)
         {
+            SavedPositionsMs.Add(Group.ContentID, PositionMs);
+        }
+        const bool bHasDevice = Sources.ContainsByPredicate(
+            [ContentID = Group.ContentID](const FRadioEmitterSnapshot& Source)
+            {
+                return Source.ContentID == ContentID;
+            });
+        if (!bHasDevice)
+        {
+            DestroySyncGroup(Group);
+            SyncGroups.RemoveAt(Index);
+            if (bShuttingDown)
+            {
+                return false;
+            }
             continue;
         }
-        OutFailed.Add(SyncGroups[Index].ContentID);
-        DestroySyncGroup(SyncGroups[Index]);
+        if (IsSyncGroupAlive(Group) && UpdateSyncGroup(Group, bHasListener))
+        {
+            if (bMuteForMissingListener)
+            {
+                MuteSyncGroup(Group);
+            }
+            continue;
+        }
+        OutFailed.Add(Group.ContentID);
+        DestroySyncGroup(Group);
         SyncGroups.RemoveAt(Index);
         if (bShuttingDown)
         {
             return false;
         }
     }
-    return bAvailable && OutFailed.IsEmpty();
+    return OutFailed.IsEmpty();
 }
 
-bool URadioPlaybackManager::CreateSyncGroup(FName InContentID)
+void URadioPlaybackManager::RequestMedia()
 {
-    const ANSICHAR* SwitchValue = ResolveRadioSwitch(InContentID);
-    if (!FAkAudioDevice::IsInitialized() || !IsValid(PlayRadioEvent) || !IsValid(StopRadioEvent))
+    ReleaseMedia();
+    bResourcesRequested = true;
+    const auto* Settings = GetDefault<UWandererRadioAudioSettings>();
+    RequestedPlayEvent = Settings->PlayEvent;
+    RequestedStopEvent = Settings->StopEvent;
+    const TArray<FSoftObjectPath> Paths{
+        RequestedPlayEvent.ToSoftObjectPath(), RequestedStopEvent.ToSoftObjectPath()};
+    if (!Paths[0].IsNull() && !Paths[1].IsNull())
+    {
+        MediaRequest = UAssetManager::GetStreamableManager().RequestAsyncLoad(
+            Paths, FStreamableDelegate(), FMath::RoundToInt(LoadPriority));
+    }
+    MediaStatus = MediaRequest ? EAudioEventResourceStatus::Pending : EAudioEventResourceStatus::Failed;
+    MediaDeadlineSec = 0;
+    if (!MediaRequest)
+    {
+        Status = TEXT("Radio Event paths are unavailable.");
+    }
+}
+
+void URadioPlaybackManager::AdvanceMedia()
+{
+    if (MediaStatus != EAudioEventResourceStatus::Pending)
+    {
+        return;
+    }
+    if (MediaDeadlineSec <= 0)
+    {
+        MediaDeadlineSec = FPlatformTime::Seconds() + RadioPlaybackDefaults::MediaTimeoutSec;
+    }
+    if (FPlatformTime::Seconds() >= MediaDeadlineSec)
+    {
+        Status = TEXT("Radio audio preload timed out.");
+        MediaStatus = EAudioEventResourceStatus::Failed;
+        ReleaseMedia();
+        return;
+    }
+    if (MediaRequest)
+    {
+        if (!MediaRequest->HasLoadCompleted())
+        {
+            return;
+        }
+        EventLeases = NewObject<UAudioEventLeaseManager>(this);
+        PlayRadioEvent = RequestedPlayEvent.Get();
+        StopRadioEvent = RequestedStopEvent.Get();
+        if (!EventLeases->Acquire(PlayRadioEvent) || !EventLeases->Acquire(StopRadioEvent))
+        {
+            Status = TEXT("Radio requires valid Play and Stop Events.");
+            MediaStatus = EAudioEventResourceStatus::Failed;
+            ReleaseMedia();
+            return;
+        }
+        MediaRequest.Reset();
+    }
+    if (!WandererAudioBackend::IsInitialized())
+    {
+        return;
+    }
+    const EAudioEventResourceStatus PlayStatus = EventLeases->Advance(PlayRadioEvent, LoadPriority);
+    const EAudioEventResourceStatus StopStatus = EventLeases->Advance(StopRadioEvent, LoadPriority);
+    if (PlayStatus == EAudioEventResourceStatus::Failed || StopStatus == EAudioEventResourceStatus::Failed)
+    {
+        Status = TEXT("Radio media preload failed; check generated SoundBanks.");
+        MediaStatus = EAudioEventResourceStatus::Failed;
+        ReleaseMedia();
+    }
+    else if (PlayStatus == EAudioEventResourceStatus::Ready && StopStatus == EAudioEventResourceStatus::Ready)
+    {
+        MediaStatus = EAudioEventResourceStatus::Ready;
+        Status.Reset();
+    }
+}
+
+void URadioPlaybackManager::ReleaseMedia()
+{
+    if (MediaRequest)
+    {
+        MediaRequest->CancelHandle();
+        MediaRequest.Reset();
+    }
+    if (EventLeases)
+    {
+        EventLeases->Stop();
+        EventLeases = nullptr;
+    }
+    PlayRadioEvent = nullptr;
+    StopRadioEvent = nullptr;
+    RequestedPlayEvent.Reset();
+    RequestedStopEvent.Reset();
+}
+
+void URadioPlaybackManager::ParkPlayback()
+{
+    for (FRadioSyncGroup& Group : SyncGroups)
+    {
+        const int32 PositionMs = WandererAudioBackend::GetPlaybackPositionMs(Group.PlayingID);
+        if (PositionMs >= 0)
+        {
+            SavedPositionsMs.Add(Group.ContentID, PositionMs);
+        }
+        DestroySyncGroup(Group);
+    }
+    SyncGroups.Reset();
+    PendingStarts.Reset();
+    AdmittedContents.Reset();
+    ReleaseMedia();
+    bResourcesRequested = false;
+    bWaitingForListener = false;
+    bWithinLoadRange = false;
+    bHasSpatialSample = false;
+    MediaStatus = EAudioEventResourceStatus::Pending;
+}
+
+void URadioPlaybackManager::UpdatePendingStarts(TArray<FName>& OutFailed)
+{
+    for (auto It = PendingStarts.CreateIterator(); It && !bShuttingDown; ++It)
+    {
+        const FName ContentID = *It;
+        if (!Sources.ContainsByPredicate([ContentID](const FRadioEmitterSnapshot& Source)
+            {
+                return Source.ContentID == ContentID && Source.bPlaying;
+            }))
+        {
+            It.RemoveCurrent();
+        }
+        else if (MediaStatus != EAudioEventResourceStatus::Pending)
+        {
+            const EGroupStart Result = MediaStatus == EAudioEventResourceStatus::Failed
+                ? EGroupStart::Failed
+                : FindSyncGroup(ContentID) ? EGroupStart::Started : CreateSyncGroup(ContentID);
+            if (Result != EGroupStart::WaitingForEmitters)
+            {
+                It.RemoveCurrent();
+                if (Result == EGroupStart::Failed)
+                {
+                    OutFailed.Add(ContentID);
+                }
+            }
+        }
+    }
+}
+
+bool URadioPlaybackManager::IsSyncGroupAlive(const FRadioSyncGroup& InGroup) const
+{
+    return IsValid(InGroup.Emitter) && InGroup.Emitter->IsRegistered()
+        && InGroup.Emitter->IsRegisteredWithWwise() && IsValid(PlayRadioEvent)
+        && InGroup.PlayingID
+        && WandererAudioBackend::QueryPlaybackActive(PlayRadioEvent, InGroup.PlayingID).Get(true);
+}
+
+void URadioPlaybackManager::MuteSyncGroup(const FRadioSyncGroup& InGroup) const
+{
+    if (UAkComponent* Emitter = InGroup.Emitter.Get(); IsValid(Emitter))
+    {
+        Emitter->SetComponentTickEnabled(false);
+        WandererAudioBackend::SetRadioEmitterGain(*Emitter, 0, RadioPlaybackDefaults::TransitionMs);
+    }
+}
+
+URadioPlaybackManager::EGroupStart URadioPlaybackManager::CreateSyncGroup(FName InContentID)
+{
+    if (!AdmittedContents.Contains(InContentID))
+    {
+        Status = TEXT("Waiting for world item audio admission.");
+        return EGroupStart::WaitingForEmitters;
+    }
+    const TOptional<ERadioContent> Content = ResolveRadioContent(InContentID);
+    if (!WandererAudioBackend::IsInitialized() || MediaStatus != EAudioEventResourceStatus::Ready
+        || !UAudioEventLeaseManager::IsReady(PlayRadioEvent) || !UAudioEventLeaseManager::IsReady(StopRadioEvent))
     {
         Status = TEXT(
             "Radio audio unavailable; sync Play_Radio/Stop_Radio and generate Windows SoundBanks.");
-        return false;
+        return EGroupStart::Failed;
     }
-    if (!SwitchValue)
+    if (!Content.IsSet())
     {
         Status = TEXT("Unknown debug radio content; choose Song, Noise or Hiss.");
-        return false;
+        return EGroupStart::Failed;
     }
     // Retain paused clocks across retrieval, but never accumulate more than four content groups.
     for (int32 Index = SyncGroups.Num() - 1; Index >= 0; --Index)
@@ -187,41 +441,71 @@ bool URadioPlaybackManager::CreateSyncGroup(FName InContentID)
         SyncGroups.RemoveAt(Index);
         if (bShuttingDown)
         {
-            return false;
+            return EGroupStart::Failed;
         }
     }
     if (SyncGroups.Num() >= RadioPlaybackDefaults::ContentGroupCountMax)
     {
         Status = TEXT("All four content groups are assigned.");
-        return false;
+        return EGroupStart::Failed;
+    }
+    UAudioEmitterPool* Pool = EmitterPoolWeakPtr.Get();
+    if (!Pool)
+    {
+        Status = TEXT("The radio emitter pool is unavailable.");
+        return EGroupStart::Failed;
+    }
+    UAkComponent* Emitter = Pool->Acquire(*this, false);
+    if (!Emitter)
+    {
+        Status = TEXT("Waiting for a radio emitter.");
+        return EGroupStart::WaitingForEmitters;
     }
     FRadioSyncGroup& Group = SyncGroups.AddDefaulted_GetRef();
     Group.ContentID = InContentID;
-    Group.bStereo = InContentID != TEXT("RECORDER_TAPE_HISS");
-    Group.PlayingIDs.SetNumZeroed(FRadioChannelLayout::SlotCount);
-    if (!StartSyncGroupSlots(Group, SwitchValue))
+    Group.Emitter = Emitter;
+    Group.bStereo = Content.GetValue() != ERadioContent::Hiss;
+    if (!StartSyncGroupPlayback(Group, Content.GetValue()))
     {
         DestroySyncGroup(Group);
         SyncGroups.Pop();
         Status =
             TEXT("Radio Switch or Event rejected; check RadioPlayback and generated SoundBanks.");
-        return false;
+        return EGroupStart::Failed;
     }
-    return true;
+    Status.Reset();
+    return EGroupStart::Started;
 }
 
-void URadioPlaybackManager::DestroySyncGroup(FRadioSyncGroup& InOutGroup)
+void URadioPlaybackManager::DestroySyncGroup(FRadioSyncGroup& InOutGroup, int32 InFadeMs)
 {
-    StopSyncGroup(InOutGroup);
-    for (UAkComponent* Emitter : InOutGroup.Emitters)
+    AdmittedContents.Remove(InOutGroup.ContentID);
+    UAkComponent* Emitter = InOutGroup.Emitter.Get();
+    const uint32 PlayID = InOutGroup.PlayingID;
+    uint32 StopID = 0;
+    if (PlayID && WandererAudioBackend::IsDeviceReady())
     {
-        if (IsValid(Emitter))
+        if (EventLeases && EventLeases->Acquire(PlayRadioEvent))
         {
-            Emitter->DestroyComponent();
+            EventLeases->Retire(PlayRadioEvent, PlayID, -1, 0);
+        }
+        if (InFadeMs == 0 && IsValid(Emitter) && Emitter->IsRegisteredWithWwise() && EventLeases
+            && EventLeases->Acquire(StopRadioEvent))
+        {
+            StopID = UAudioEventLeaseManager::Post(*StopRadioEvent, Emitter);
+            EventLeases->Retire(StopRadioEvent, StopID, -1, 0);
+        }
+        if (!StopID)
+        {
+            WandererAudioBackend::StopPlayback(PlayID, InFadeMs);
         }
     }
-    InOutGroup.Emitters.Reset();
-    InOutGroup.PlayingIDs.Reset();
+    if (UAudioEmitterPool* Pool = EmitterPoolWeakPtr.Get())
+    {
+        Pool->BeginRadioRelease(*this, Emitter, PlayRadioEvent, PlayID, StopRadioEvent, StopID);
+    }
+    InOutGroup.Emitter = nullptr;
+    InOutGroup.PlayingID = 0;
 }
 
 const FRadioSyncGroup* URadioPlaybackManager::FindSyncGroup(FName InContentID) const
@@ -240,6 +524,10 @@ void URadioPlaybackManager::FinishOperation()
     {
         ReleaseResources();
     }
+    else
+    {
+        ApplyPendingAdmissions();
+    }
 }
 
 void URadioPlaybackManager::ReleaseResources()
@@ -250,200 +538,114 @@ void URadioPlaybackManager::ReleaseResources()
     }
     SyncGroups.Reset();
     Sources.Reset();
-    PlayRadioEvent = nullptr;
-    StopRadioEvent = nullptr;
+    PendingStarts.Reset();
+    SavedPositionsMs.Reset();
+    ReleaseMedia();
     OwnerWeakPtr.Reset();
+    EmitterPoolWeakPtr.Reset();
 }
 
-bool URadioPlaybackManager::StartSyncGroupSlots(
-    FRadioSyncGroup& InOutGroup, const ANSICHAR* InSwitchValue)
+bool URadioPlaybackManager::StartSyncGroupPlayback(
+    FRadioSyncGroup& InOutGroup, ERadioContent InContent)
 {
-    FDiagnosticTraceScope Trace;
-    IWwiseSoundEngineAPI* Engine = IWwiseSoundEngineAPI::Get();
-    if (!Engine)
+    UAkComponent* Emitter = InOutGroup.Emitter.Get();
+    if (bShuttingDown || !IsValid(Emitter) || !Emitter->IsRegisteredWithWwise())
     {
         return false;
     }
-    for (int32 Slot = 0; Slot < FRadioChannelLayout::SlotCount; ++Slot)
+    Emitter->bUseReverbVolumes = true;
+    Emitter->SetComponentTickInterval(RadioPlaybackDefaults::EmitterUpdateIntervalSec);
+    if (!WandererAudioBackend::ConfigureRadioEmitter(*Emitter, InContent))
     {
-        UAkComponent* Emitter = NewObject<UAkComponent>(OwnerWeakPtr.Get());
-        InOutGroup.Emitters.Add(Emitter);
-        Emitter->bUseReverbVolumes = true;
-        Emitter->OcclusionRefreshInterval = 0;
-        Emitter->RegisterComponent();
-        if (bShuttingDown || !IsValid(Emitter))
-        {
-            return false;
-        }
-        Emitter->SetComponentTickInterval(RadioPlaybackDefaults::EmitterUpdateIntervalSec);
-        Emitter->SetRTPCValue(nullptr, 0, 0, TEXT("DeviceGain"));
-        if (Engine->SetSwitch("RadioPlayback", InSwitchValue, Emitter->GetAkGameObjectID())
-            != AK_Success)
-        {
-            return false;
-        }
+        return false;
     }
-    // No asynchronous callback. All content slots enter the same Wwise command batch.
-    for (int32 Slot = 0; Slot < FRadioChannelLayout::SlotCount; ++Slot)
+
+    FDiagnosticTraceScope Trace;
+    InOutGroup.PlayingID = UAudioEventLeaseManager::Post(*PlayRadioEvent, Emitter);
+    WANDERER_DIAGNOSTIC(this,
+        EDiagnosticDomain::Audio,
+        TEXT("radio-post-result"),
+        !InOutGroup.PlayingID,
+        FString::Printf(TEXT("content=%s event=%s switch=RadioPlayback:%hs playingID=%u target=%s"),
+            *InOutGroup.ContentID.ToString(),
+            *GetPathNameSafe(PlayRadioEvent),
+            WandererAudioBackend::GetRadioSwitchName(InContent),
+            InOutGroup.PlayingID,
+            *GetPathNameSafe(Emitter)));
+    if (bShuttingDown || !InOutGroup.PlayingID)
     {
-        InOutGroup.PlayingIDs[Slot] = PlayRadioEvent->PostOnComponent(
-            InOutGroup.Emitters[Slot], FOnAkPostEventCallback(), 0, true);
-        WANDERER_DIAGNOSTIC(this,
-            EDiagnosticDomain::Audio,
-            TEXT("radio-post-result"),
-            !InOutGroup.PlayingIDs[Slot],
-            FString::Printf(TEXT("content=%s slot=%d event=%s switch=RadioPlayback:%hs "
-                                 "playingID=%d target=%s"),
-                *InOutGroup.ContentID.ToString(),
-                Slot,
-                *GetPathNameSafe(PlayRadioEvent),
-                InSwitchValue,
-                InOutGroup.PlayingIDs[Slot],
-                *GetPathNameSafe(InOutGroup.Emitters[Slot])));
-        if (bShuttingDown || !InOutGroup.PlayingIDs[Slot])
-        {
-            return false;
-        }
+        return false;
+    }
+    const int32 PositionMs = SavedPositionsMs.FindRef(InOutGroup.ContentID);
+    if (PositionMs > 0 && !WandererAudioBackend::RestoreRadioPosition(
+            *PlayRadioEvent, *Emitter, InOutGroup.PlayingID, PositionMs))
+    {
+        return false;
+    }
+    SavedPositionsMs.FindOrAdd(InOutGroup.ContentID);
+    return true;
+}
+
+bool URadioPlaybackManager::UpdateSyncGroup(FRadioSyncGroup& InOutGroup, bool bInHasListener)
+{
+    if (!WandererAudioBackend::IsSoundEngineReady())
+    {
+        return !bInHasListener;
+    }
+    const FRadioChannelLayout Layout(Sources, InOutGroup.ContentID, InOutGroup.bStereo);
+    const bool bShouldPause = !Layout.HasPlaybackRequest();
+    if (bShouldPause && !InOutGroup.bPaused)
+    {
+        // No audible positions remain. Keep the same paused PlayingID for the next placement.
+        MuteSyncGroup(InOutGroup);
+    }
+    if (!bShouldPause && bInHasListener && !UpdateSyncPositions(*InOutGroup.Emitter, Layout))
+    {
+        return false;
+    }
+    if (InOutGroup.bPaused != bShouldPause)
+    {
+        WandererAudioBackend::SetPlaybackPaused(
+            InOutGroup.PlayingID, bShouldPause, RadioPlaybackDefaults::TransitionMs);
+        InOutGroup.bPaused = bShouldPause;
     }
     return true;
 }
 
-void URadioPlaybackManager::StopSyncGroup(FRadioSyncGroup& InOutGroup)
+bool URadioPlaybackManager::UpdateSyncPositions(
+    UAkComponent& InOutEmitter, const FRadioChannelLayout& InLayout)
 {
-    FAkAudioDevice* Device = FAkAudioDevice::IsInitialized() ? FAkAudioDevice::Get() : nullptr;
-    if (!Device)
+    TArray<FTransform> Positions;
+    TArray<ERadioChannel> Channels;
+    Positions.Reserve(FRadioChannelLayout::SlotCount);
+    Channels.Reserve(FRadioChannelLayout::SlotCount);
+    for (int32 Slot = 0; Slot < FRadioChannelLayout::SlotCount; ++Slot)
     {
-        return;
-    }
-    for (int32 Slot = 0; Slot < InOutGroup.PlayingIDs.Num(); ++Slot)
-    {
-        const int32 ID = InOutGroup.PlayingIDs[Slot];
-        if (!ID)
+        const FRadioEmitterSnapshot* Member = InLayout.GetMember(Slot);
+        if (Member && Member->bPlaying && !Member->Transform.ContainsNaN())
         {
-            continue;
-        }
-        UAkComponent* Emitter =
-            InOutGroup.Emitters.IsValidIndex(Slot) ? InOutGroup.Emitters[Slot].Get() : nullptr;
-        if (!IsValid(Emitter) || !IsValid(StopRadioEvent)
-            || !StopRadioEvent->PostOnComponent(Emitter, FOnAkPostEventCallback(), 0, true))
-        {
-            Device->StopPlayingID(ID, 0);
+            Positions.Add(Member->Transform);
+            Channels.Add(InLayout.GetChannel(Slot));
         }
     }
-}
+    if (Positions.IsEmpty())
+    {
+        InOutEmitter.SetComponentTickEnabled(false);
+        return WandererAudioBackend::SetRadioEmitterGain(
+            InOutEmitter, 0, RadioPlaybackDefaults::TransitionMs);
+    }
 
-bool URadioPlaybackManager::UpdateDeviceEmitter(UAkComponent& InOutEmitter,
-    const FRadioEmitterSnapshot& InSource,
-    int32 InChannelMask,
-    float InGain)
-{
-    FAkAudioDevice* Device = FAkAudioDevice::Get();
-    IWwiseSoundEngineAPI* Engine = IWwiseSoundEngineAPI::Get();
-    if (!Device || !Engine)
-    {
-        return false;
-    }
-    const FTransform Position = InSource.Transform;
-    InOutEmitter.SetWorldTransform(Position);
+    InOutEmitter.SetWorldTransform(Positions[0]);
     if (bShuttingDown || !IsValid(&InOutEmitter))
     {
         return false;
     }
-    InOutEmitter.UpdateSpatialAudioRoom(Position.GetLocation());
-    TArray<FTransform> Positions = {Position};
-    FAkChannelMask Mask;
-    Mask.ChannelMask = InChannelMask;
-    TArray<FAkChannelMask> Masks = {Mask};
-    return Device->SetMultiplePositions(
-               &InOutEmitter, Masks, Positions, EAkMultiPositionType::SingleSource)
-               == AK_Success
-           && Engine->SetRTPCValue("DeviceGain",
-                  InGain,
-                  InOutEmitter.GetAkGameObjectID(),
-                  RadioPlaybackDefaults::TransitionMs)
-                  == AK_Success;
-}
-
-bool URadioPlaybackManager::UpdateSyncGroup(FRadioSyncGroup& InOutGroup, float InDeltaTime)
-{
-    FAkAudioDevice* Device = FAkAudioDevice::Get();
-    IWwiseSoundEngineAPI* Engine = IWwiseSoundEngineAPI::Get();
-    if (!Device || !Engine || InOutGroup.Emitters.Num() != FRadioChannelLayout::SlotCount
-        || InOutGroup.PlayingIDs.Num() != FRadioChannelLayout::SlotCount)
+    if (!WandererAudioBackend::UpdateRadioEmitter(InOutEmitter, Positions, Channels,
+            InLayout.GetGain(), RadioPlaybackDefaults::TransitionMs))
     {
+        UE_LOG(LogWandererRadioPlayback, Warning, TEXT("Radio position or gain update failed."));
         return false;
     }
-    const FRadioChannelLayout Layout(Sources, InOutGroup.ContentID, InOutGroup.bStereo);
-    for (int32 Slot = 0; Slot < FRadioChannelLayout::SlotCount; ++Slot)
-    {
-        if (!UpdateSyncSlot(InOutGroup, Layout, Slot, InDeltaTime))
-        {
-            return false;
-        }
-    }
-    const bool bAnyPlaying = Layout.HasPlaybackRequest();
-    if (InOutGroup.bPaused == bAnyPlaying)
-    {
-        for (int32 ID : InOutGroup.PlayingIDs)
-        {
-            Engine->ExecuteActionOnPlayingID(
-                bAnyPlaying ? AkActionOnEventType_Resume : AkActionOnEventType_Pause,
-                ID,
-                RadioPlaybackDefaults::TransitionMs,
-                AkCurveInterpolation_Linear);
-        }
-        InOutGroup.bPaused = !bAnyPlaying;
-    }
-    return true;
-}
-
-bool URadioPlaybackManager::UpdateSyncSlot(FRadioSyncGroup& InOutGroup,
-    const FRadioChannelLayout& InLayout,
-    int32 InSlot,
-    float InDeltaTime)
-{
-    FAkAudioDevice* Device = FAkAudioDevice::Get();
-    IWwiseSoundEngineAPI* Engine = IWwiseSoundEngineAPI::Get();
-
-    if (!IsValid(InOutGroup.Emitters[InSlot]) || !InOutGroup.PlayingIDs[InSlot]
-        || !IsValid(PlayRadioEvent))
-    {
-        return false;
-    }
-    if (InDeltaTime > 0
-        && !Device->IsPlayingIDActive(PlayRadioEvent->GetShortID(), InOutGroup.PlayingIDs[InSlot]))
-    {
-        UE_LOG(LogWandererRecorder,
-            Warning,
-            TEXT("Content %s slot %d PlayingID %d ended"),
-            *InOutGroup.ContentID.ToString(),
-            InSlot,
-            InOutGroup.PlayingIDs[InSlot]);
-        return false;
-    }
-    if (const FRadioEmitterSnapshot* Member = InLayout.GetMember(InSlot))
-    {
-        // Paused devices remain in the channel assignment; a partner does not change sides.
-        if (!UpdateDeviceEmitter(*InOutGroup.Emitters[InSlot],
-                *Member,
-                InLayout.GetChannelMask(InSlot),
-                Member->bPlaying ? InLayout.GetGain() : 0.0f))
-        {
-            UE_CLOG(!bShuttingDown,
-                LogWandererRecorder,
-                Warning,
-                TEXT("Position/gain failed for slot %d"),
-                InSlot);
-            return false;
-        }
-    }
-    else if (Engine->SetRTPCValue("DeviceGain",
-                 0,
-                 InOutGroup.Emitters[InSlot]->GetAkGameObjectID(),
-                 RadioPlaybackDefaults::TransitionMs)
-             != AK_Success)
-    {
-        return false;
-    }
+    InOutEmitter.SetComponentTickEnabled(true);
     return true;
 }

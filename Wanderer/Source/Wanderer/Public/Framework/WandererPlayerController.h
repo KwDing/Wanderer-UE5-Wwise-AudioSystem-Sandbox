@@ -164,12 +164,6 @@ class WANDERER_API AWandererPlayerController : public APlayerController,
     UPROPERTY(EditDefaultsOnly, Category = "Wanderer|Audio", meta = (ClampMin = "0.1", Units = "s"))
     float MinWaterStateInterval = 0.5f;
 
-    UPROPERTY()
-    TObjectPtr<UAkAudioEvent> MenuPauseEvent;
-
-    UPROPERTY()
-    TObjectPtr<UAkAudioEvent> MenuResumeEvent;
-
     UPROPERTY(VisibleAnywhere, Category = "Wanderer|Speaker")
     TObjectPtr<URadioControlModel> RadioControlModel;
 
@@ -209,7 +203,7 @@ class WANDERER_API AWandererPlayerController : public APlayerController,
     void NotifyFeaturesStopped();
     void PrepareInputTransition();
     void ApplyInputMode(EWandererPlayState InState);
-    void InitializeAudioDefaults();
+    void PrepareLocalAudio();
     void UpdateUnderwaterAudio();
     void ResetUnderwaterAudio(bool bReleaseOwnership);
     void StartSpeakerPlacement();

@@ -166,15 +166,11 @@ void UWandererAudioSourceComponent::BeginPlay()
 
 void UWandererAudioSourceComponent::EndPlay(const EEndPlayReason::Type Reason)
 {
-    if (UWandererAudioSubsystem* System = GetWorld()->GetSubsystem<UWandererAudioSubsystem>())
+    UWorld* World = GetWorld();
+    if (UWandererAudioSubsystem* System = World ? World->GetSubsystem<UWandererAudioSubsystem>() : nullptr)
     {
         System->UnregisterSource(this);
     }
     ShutdownPlayback();
-    if (OwnedEmitter)
-    {
-        OwnedEmitter->DestroyComponent();
-    }
-    OwnedEmitter = nullptr;
     Super::EndPlay(Reason);
 }

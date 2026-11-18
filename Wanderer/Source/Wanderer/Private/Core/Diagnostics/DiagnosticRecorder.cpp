@@ -14,7 +14,7 @@ namespace
     constexpr int32 MaximumTransitions = 512;
     constexpr int32 MaximumDetailCharacters = 2048;
     constexpr double RateWindowSeconds = 1.0;
-    FDiagnosticSnapshot State;
+    FDiagnosticSnapshot DiagnosticSnapshotState;
     TMap<FObjectKey, FString> Transitions;
     FString Focus;
     uint64 CurrentTrace = 0;
@@ -29,7 +29,7 @@ namespace
     TAutoConsoleVariable<int32> Preset(TEXT("Wanderer.Diagnostic.Preset"),
         0,
         TEXT("0 problems; 1 playback; 2 spatial; 3 events; 4 all. Detailed capture expires."));
-    TAutoConsoleVariable<int32> Footsteps(
+    TAutoConsoleVariable<int32> DiagnosticFootstepSamplingVariable(
         TEXT("Wanderer.Diagnostic.Footsteps"), 0, TEXT("Opt into sampled footsteps. Default off."));
     TAutoConsoleVariable<int32> Rate(TEXT("Wanderer.Diagnostic.MaxPerSecond"),
         40,
@@ -99,7 +99,7 @@ bool FDiagnosticRecorder::IsEnabled(EDiagnosticDomain InDomain, bool bInProblem)
 bool FDiagnosticRecorder::IsFootstepsEnabled()
 {
 #if !UE_BUILD_SHIPPING
-    return IsInGameThread() && Footsteps.GetValueOnGameThread() != 0;
+    return IsInGameThread() && DiagnosticFootstepSamplingVariable.GetValueOnGameThread() != 0;
 #else
     return false;
 #endif
@@ -109,7 +109,7 @@ void FDiagnosticRecorder::SetFootstepsEnabled(bool bInEnabled)
 {
 #if !UE_BUILD_SHIPPING
     check(IsInGameThread());
-    Footsteps.AsVariable()->Set(bInEnabled ? 1 : 0, ECVF_SetByConsole);
+    DiagnosticFootstepSamplingVariable.AsVariable()->Set(bInEnabled ? 1 : 0, ECVF_SetByConsole);
 #endif
 }
 
@@ -180,7 +180,7 @@ bool FDiagnosticRecorder::Admit(
     }
     if (WindowCount >= FMath::Clamp(Rate.GetValueOnGameThread(), 1, 200))
     {
-        ++State.Suppressed;
+        ++DiagnosticSnapshotState.Suppressed;
         return false;
     }
     ++WindowCount;
@@ -218,20 +218,20 @@ void FDiagnosticRecorder::Record(const UObject* InContext,
         World ? static_cast<int32>(World->GetNetMode()) : -1,
         *Escape(GetPathNameSafe(InContext)),
         *Escape(InDetail));
-    if (State.Records.Num() >= MaximumRecords)
+    if (DiagnosticSnapshotState.Records.Num() >= MaximumRecords)
     {
-        State.Records.RemoveAt(0, 1, EAllowShrinking::No);
-        ++State.Evicted;
+        DiagnosticSnapshotState.Records.RemoveAt(0, 1, EAllowShrinking::No);
+        ++DiagnosticSnapshotState.Evicted;
     }
-    State.Records.Add(MoveTemp(Entry));
-    ++State.Revision;
+    DiagnosticSnapshotState.Records.Add(MoveTemp(Entry));
+    ++DiagnosticSnapshotState.Revision;
     if (InDomain == EDiagnosticDomain::Events)
     {
-        UE_LOG(LogWandererEvents, Verbose, TEXT("%s"), *State.Records.Last().Json);
+        UE_LOG(LogWandererEvents, Verbose, TEXT("%s"), *DiagnosticSnapshotState.Records.Last().Json);
     }
     else
     {
-        UE_LOG(LogWandererAudio, Verbose, TEXT("%s"), *State.Records.Last().Json);
+        UE_LOG(LogWandererAudio, Verbose, TEXT("%s"), *DiagnosticSnapshotState.Records.Last().Json);
     }
 #endif
 }
@@ -261,28 +261,28 @@ void FDiagnosticRecorder::CommitTransition(const UObject* InContext, const FStri
 uint64 FDiagnosticRecorder::GetRevision()
 {
     check(IsInGameThread());
-    return State.Revision;
+    return DiagnosticSnapshotState.Revision;
 }
 
 uint64 FDiagnosticRecorder::GetSuppressedCount()
 {
     check(IsInGameThread());
-    return State.Suppressed;
+    return DiagnosticSnapshotState.Suppressed;
 }
 
 FDiagnosticSnapshot FDiagnosticRecorder::GetSnapshot()
 {
     check(IsInGameThread());
-    return State;
+    return DiagnosticSnapshotState;
 }
 
 void FDiagnosticRecorder::Clear()
 {
     check(IsInGameThread());
-    State.Records.Reset();
-    State.Suppressed = 0;
-    State.Evicted = 0;
-    ++State.Revision;
+    DiagnosticSnapshotState.Records.Reset();
+    DiagnosticSnapshotState.Suppressed = 0;
+    DiagnosticSnapshotState.Evicted = 0;
+    ++DiagnosticSnapshotState.Revision;
     Transitions.Reset();
     WindowCount = 0;
 }

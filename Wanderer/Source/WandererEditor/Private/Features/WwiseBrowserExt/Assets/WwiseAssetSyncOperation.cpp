@@ -76,6 +76,10 @@ namespace
         UPackage* Package = CreatePackage(*InRecord.Package);
         UAkAudioType* Created = NewObject<UAkAudioType>(
             Package, AssetClass, FName(*InName), RF_Public | RF_Standalone | RF_Transactional);
+        if (Created->IsA<UAkAudioEvent>())
+        {
+            Created->bAutoLoad = false;
+        }
         FAssetRegistryModule::AssetCreated(Created);
         if (!FWwiseAssetRepository::UpdateBinding(*Created, InRecord, OutResult))
         {

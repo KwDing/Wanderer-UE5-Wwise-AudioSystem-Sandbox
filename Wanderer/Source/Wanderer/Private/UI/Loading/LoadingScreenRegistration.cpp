@@ -130,5 +130,5 @@ namespace
             GetMoviePlayer()->PlayMovie();
         }
     };
-    FLoadingScreenRegistration Registration;
+    FLoadingScreenRegistration LoadingScreenRegistration;
 }

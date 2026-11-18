@@ -4,6 +4,8 @@
 #include "Engine/DataTable.h"
 #include "Engine/World.h"
 
+#include "AkComponent.h"
+
 #include "Tests/AudioRuntime/AudioSchedulingTestSource.h"
 #include "Systems/Audio/WandererAudioSubsystem.h"
 #include "Actors/Audio/WandererWorldAudioBudget.h"
@@ -171,6 +173,42 @@ bool FAudioSchedulingAdmissionTest::RunTest(const FString& Parameters)
     return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAudioSchedulingIdentityTest,
+    "Wanderer.Audio.Scheduling.Identity",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FAudioSchedulingIdentityTest::RunTest(const FString& InParameters)
+{
+    FAudioSchedulingTestWorld Fixture;
+    if (!TestNotNull(TEXT("World"), Fixture.World))
+    {
+        return false;
+    }
+    AWandererWorldAudioEmitter* Owner = Fixture.World->SpawnActor<AWandererWorldAudioEmitter>();
+    UWandererAudioSourceComponent* First =
+        Owner->FindComponentByClass<UWandererAudioSourceComponent>();
+    UWandererAudioSourceComponent* Second =
+        NewObject<UWandererAudioSourceComponent>(Owner);
+    Owner->AddInstanceComponent(Second);
+    Second->RegisterComponent();
+    UDataTable* Table = NewObject<UDataTable>(Owner);
+    Table->RowStruct = FWandererWorldAudioProfileRow::StaticStruct();
+    const FName RowName(TEXT("Point"));
+    FWandererWorldAudioProfileRow Row;
+    Row.Mode = EWandererWorldAudioMode::Point;
+    Table->AddRow(RowName, Row);
+    First->Profile.DataTable = Second->Profile.DataTable = Table;
+    First->Profile.RowName = Second->Profile.RowName = RowName;
+    Owner->DispatchBeginPlay();
+    TestEqual(TEXT("First source identity is the component"), First->GetPlaybackIdentity(),
+        static_cast<const UObject*>(First));
+    TestEqual(TEXT("Second source on same actor has its own identity"), Second->GetPlaybackIdentity(),
+        static_cast<const UObject*>(Second));
+    TestNull(TEXT("Looking up admitted or rejected candidates does not register an AkComponent"),
+        Owner->FindComponentByClass<UAkComponent>());
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAudioSchedulingResidencyTest,
                                  "Wanderer.Audio.Scheduling.Residency",
                                  EAutomationTestFlags::EditorContext
@@ -300,6 +338,61 @@ bool FAudioSuspensionReentryTest::RunTest(const FString& InParameters)
     TestEqual(TEXT("First source suspended"), Source->UpdateCount, 1);
     TestEqual(TEXT("Teardown stops both sources"), Other->ShutdownCount, 1);
     TestEqual(TEXT("No suspension callback after teardown"), Other->UpdateCount, 0);
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAudioSchedulingPreparationTest,
+    "Wanderer.Audio.Scheduling.PrepareBeforeReplacement",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FAudioSchedulingPreparationTest::RunTest(const FString& InParameters)
+{
+    FAudioSchedulingTestWorld Fixture;
+    auto* Audio = Fixture.World->GetSubsystem<UWandererAudioSubsystem>();
+    auto* Budget = Fixture.World->SpawnActor<AWandererWorldAudioBudget>();
+    Budget->RegularSlots = 1;
+    auto* Current = Fixture.CreateSource(TEXT("Current"));
+    Current->Info.Priority = 10;
+    Current->Info.bPlaying = true;
+    auto* Incoming = Fixture.CreateSource(TEXT("Incoming"));
+    Incoming->Info.Priority = 90;
+    Incoming->bMediaReady = false;
+    Audio->RegisterSource(Current);
+    Audio->RegisterSource(Incoming);
+    FAudioSchedulingTestAccess::Schedule(*Audio);
+    TestTrue(TEXT("Pending media retains an eligible incumbent"), Current->bAdmitted);
+    TestFalse(TEXT("Preparing media does not post"), Incoming->bAdmitted);
+    Incoming->bMediaReady = true;
+    FAudioSchedulingTestAccess::Schedule(*Audio);
+    TestFalse(TEXT("Ready replacement retires the incumbent"), Current->bAdmitted);
+    return TestTrue(TEXT("Ready replacement is admitted"), Incoming->bAdmitted);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAudioSchedulingCrowdTest,
+    "Wanderer.Audio.Scheduling.FiftySourcesThreeSlots",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FAudioSchedulingCrowdTest::RunTest(const FString& InParameters)
+{
+    FAudioSchedulingTestWorld Fixture;
+    auto* Audio = Fixture.World->GetSubsystem<UWandererAudioSubsystem>();
+    auto* Budget = Fixture.World->SpawnActor<AWandererWorldAudioBudget>();
+    Budget->RegularSlots = 3;
+    TArray<UAudioSchedulingTestSource*> Sources;
+    for (int32 Index = 0; Index < 50; ++Index)
+    {
+        auto* Source = Fixture.CreateSource(FName(*FString::Printf(TEXT("Crowd_%02d"), Index)));
+        Source->Info.Priority = Index;
+        Source->Info.bProtected = true;
+        Sources.Add(Source);
+        Audio->RegisterSource(Source);
+    }
+    FAudioSchedulingTestAccess::Schedule(*Audio);
+    TestEqual(TEXT("Protection cannot expand the regular pool budget"), Audio->GetAdmittedCount(), 3);
+    for (int32 Index = 0; Index < Sources.Num(); ++Index)
+    {
+        TestEqual(TEXT("Only the three highest ranked emitters are admitted"),
+            Sources[Index]->bAdmitted, Index >= 47);
+    }
     return true;
 }
 #endif

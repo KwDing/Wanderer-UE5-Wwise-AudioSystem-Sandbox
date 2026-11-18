@@ -58,17 +58,28 @@ bool FBuildingAmbienceAuthoringTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("Both member paths share the same component"), System->RoomBuildingsWeakPtrs.FindRef(FSoftObjectPath(First)).Get() == Building && System->RoomBuildingsWeakPtrs.FindRef(FSoftObjectPath(Second)).Get() == Building);
     if (FAkAudioDevice::IsInitialized())
     {
-    System->UpdateBuildingListener(FVector::ZeroVector);
-    TestTrue(TEXT("First member enters building"), System->IsListenerInsideBuilding(Building));
-    System->UpdateBuildingListener(FVector(1000, 0, 0));
-    TestTrue(TEXT("Second member retains same building"), System->IsListenerInsideBuilding(Building));
-    System->UpdateBuildingListener(FVector(3000, 0, 0));
-    TestTrue(TEXT("Other building identified"), System->IsListenerInsideBuilding(Other));
-    TestFalse(TEXT("Only one active building"), System->IsListenerInsideBuilding(Building));
-    Third->Room->UnregisterComponent(); System->UpdateBuildingListener(FVector(3000, 0, 0));
-    TestFalse(TEXT("Unloaded Room cannot activate bed"), System->IsListenerInsideBuilding(Other));
-    Third->Room->RegisterComponent(); System->UpdateBuildingListener(FVector(3000, 0, 0));
-    TestTrue(TEXT("Room re-registration restores membership"), System->IsListenerInsideBuilding(Other));
+        System->UpdateBuildingListener(FVector::ZeroVector);
+        TestFalse(TEXT("First sample waits for confirmation"), System->IsListenerInsideBuilding(Building));
+        System->UpdateBuildingListener(FVector::ZeroVector);
+        TestTrue(TEXT("Second sample confirms building"), System->IsListenerInsideBuilding(Building));
+        System->UpdateBuildingListener(FVector(1000, 0, 0));
+        System->UpdateBuildingListener(FVector(1000, 0, 0));
+        TestTrue(TEXT("Second member retains same building"), System->IsListenerInsideBuilding(Building));
+        System->UpdateBuildingListener(FVector(3000, 0, 0));
+        System->UpdateBuildingListener(FVector(1000, 0, 0));
+        TestTrue(TEXT("Single boundary excursion retains building"), System->IsListenerInsideBuilding(Building));
+        System->UpdateBuildingListener(FVector(3000, 0, 0));
+        TestFalse(TEXT("Other building requires a fresh pair"), System->IsListenerInsideBuilding(Other));
+        System->UpdateBuildingListener(FVector(3000, 0, 0));
+        TestTrue(TEXT("Other building identified"), System->IsListenerInsideBuilding(Other));
+        TestFalse(TEXT("Only one active building"), System->IsListenerInsideBuilding(Building));
+        Third->Room->UnregisterComponent();
+        System->UpdateBuildingListener(FVector(3000, 0, 0));
+        TestFalse(TEXT("Unloaded Room cannot activate bed"), System->IsListenerInsideBuilding(Other));
+        Third->Room->RegisterComponent();
+        System->UpdateBuildingListener(FVector(3000, 0, 0));
+        System->UpdateBuildingListener(FVector(3000, 0, 0));
+        TestTrue(TEXT("Room re-registration restores membership"), System->IsListenerInsideBuilding(Other));
     }
     else AddInfo(TEXT("Native Room location query not run: -nosound disables Wwise; authoring/index checks only."));
     System->UnregisterSource(Other); System->UpdateBuildingListener(FVector(3000, 0, 0));

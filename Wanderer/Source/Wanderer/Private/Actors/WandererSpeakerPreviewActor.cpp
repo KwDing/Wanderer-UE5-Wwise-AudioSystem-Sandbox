@@ -7,8 +7,6 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/TextureRenderTarget2D.h"
 
-#include "Data/WandererSpeakerSettings.h"
-
 AWandererSpeakerPreviewActor::AWandererSpeakerPreviewActor()
 {
     SetRootComponent(CreateDefaultSubobject<USceneComponent>(TEXT("StudioRoot")));
@@ -64,11 +62,9 @@ UTextureRenderTarget2D* AWandererSpeakerPreviewActor::GetPreviewTexture(
     return Textures.IsValidIndex(Index) ? Textures[Index] : nullptr;
 }
 
-bool AWandererSpeakerPreviewActor::ShowItems()
+bool AWandererSpeakerPreviewActor::ShowItems(UStaticMesh* InRadioMesh, UStaticMesh* InMountedMesh)
 {
-    const UWandererSpeakerSettings* Settings = GetDefault<UWandererSpeakerSettings>();
-    UStaticMesh* Assets[] = {
-        Settings->RadioMesh.LoadSynchronous(), Settings->MountedMesh.LoadSynchronous()};
+    UStaticMesh* Assets[] = {InRadioMesh, InMountedMesh};
     if (!Assets[0] || !Assets[1])
     {
         return false;

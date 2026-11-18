@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
 #include "UObject/Object.h"
 
 #include "Types/ListenerAudioTypes.h"
@@ -8,6 +9,8 @@
 #include "ListenerAudioManager.generated.h"
 
 class UAkAudioEvent;
+class UAudioEventLeaseManager;
+struct FStreamableHandle;
 
 /**
  * Controller-owned audio session; owns global Wwise mix claims, never queries gameplay
@@ -19,6 +22,9 @@ class UListenerAudioManager : public UObject
     GENERATED_BODY()
 
 public:
+    void PrepareMenuEvents(const TSoftObjectPtr<UAkAudioEvent>& InPause,
+        const TSoftObjectPtr<UAkAudioEvent>& InResume);
+    void SetMenuMode(EListenerMenuMode InMode);
     void UpdateWater(const FListenerWaterSample& InSample);
     void ResetWater(bool bInReleaseOwnership);
     void RetryPendingMix();
@@ -32,7 +38,19 @@ private:
 
     UPROPERTY(Transient)
     TObjectPtr<UAkAudioEvent> ResumeEvent;
+    UPROPERTY(Transient)
+    TObjectPtr<UAkAudioEvent> PreparedPauseEvent;
+    UPROPERTY(Transient)
+    TObjectPtr<UAkAudioEvent> PreparedResumeEvent;
+    UPROPERTY(Transient)
+    TObjectPtr<UAudioEventLeaseManager> MenuEventLeases;
 
+    TSharedPtr<FStreamableHandle> MenuLoadHandle;
+    TSoftObjectPtr<UAkAudioEvent> PauseMenuReference;
+    TSoftObjectPtr<UAkAudioEvent> ResumeMenuReference;
+    FTSTicker::FDelegateHandle MenuPreloadTicker;
+    EListenerMenuMode RequestedMenuMode = EListenerMenuMode::Closed;
+    bool bAwaitingMenuPair = false;
     EListenerMenuMode PendingMenuMode = EListenerMenuMode::Closed;
     bool bMenuResumePending = false;
     bool bStopped = false;
@@ -50,6 +68,7 @@ private:
 
     void FinishDeviceCall();
     void ReleaseMixClaims();
+    bool AdvanceMenuPreload(float InDeltaSec);
     void ApplyWater(bool bInUnderwater, double InSampleTimeSec);
     bool SetMenuPaused(bool bInPaused, UAkAudioEvent* InEvent);
     bool ShouldApplyWater(const FListenerWaterSample& InSample, bool bInSubmerged) const;

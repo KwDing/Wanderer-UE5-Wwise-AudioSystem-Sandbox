@@ -16,7 +16,7 @@ namespace
     const FName AuthoredGrassTag(TEXT("TrialAutoGrassPCG"));
 
     FGrassRegenerationService GrassRegeneration;
-    FEditorFeatureRegistration Registration(
+    FEditorFeatureRegistration GrassRegenerationFeatureRegistration(
         TEXT("GrassRegeneration"),
         []()
         {

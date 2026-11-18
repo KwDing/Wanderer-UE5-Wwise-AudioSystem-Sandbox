@@ -62,5 +62,5 @@ namespace
             }
         }
     };
-    FRadioWidgetRegistration Registration;
+    FRadioWidgetRegistration RadioWidgetRegistration;
 } // namespace

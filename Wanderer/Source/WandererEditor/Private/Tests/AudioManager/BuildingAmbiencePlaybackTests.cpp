@@ -66,6 +66,14 @@ namespace
             if (Step < 5 && !Building.IsValid()) { Test->AddError(TEXT("Building destroyed before probe step")); return true; }
             const FVector Positions[] = { FVector(5000, 0, 0), FVector::ZeroVector, FVector(1000, 0, 0), FVector(5000, 0, 0), FVector::ZeroVector, FVector::ZeroVector };
             Player->GetPawn()->SetActorLocation(Positions[Step], false, nullptr, ETeleportType::TeleportPhysics);
+            if (Step == 3 && FirstID && Building->GetPlayingID() == 0)
+            {
+                if (auto* Event = Building->BuildingEvent.Get())
+                {
+                    bObservedTailLease |= !FAkAudioDevice::Get()->IsPlayingIDActive(Event->GetShortID(), FirstID)
+                        && System->IsEventDataResident(Event);
+                }
+            }
             if (World->GetTimeSeconds() - Since < 2) return false;
             if (Step == 0) Test->TestEqual(TEXT("Outside: no post"), Building->GetPlayingID(), 0);
             if (Step == 1)
@@ -73,19 +81,27 @@ namespace
                 FirstID = Building->GetPlayingID();
                 Test->TestTrue(TEXT("Inside: one live post"), FirstID != 0 && Building->IsPlaying());
                 Test->TestTrue(TEXT("PIE membership path resolved"), System->IsListenerInsideBuilding(Building.Get()));
+                EmitterWeakPtr = FindEmitter(FirstID);
+                Test->TestTrue(TEXT("Playback enables emitter Tick"),
+                    EmitterWeakPtr.IsValid() && EmitterWeakPtr->IsComponentTickEnabled());
             }
             if (Step == 2) Test->TestEqual(TEXT("Member transition retains Playing ID"), Building->GetPlayingID(), FirstID);
             if (Step == 3)
             {
                 Test->TestEqual(TEXT("Outside: fade completed"), Building->GetPlayingID(), 0);
+                Test->TestTrue(TEXT("Lease survives Wwise playing ID during tail hold"), bObservedTailLease);
                 auto* Event = LoadObject<UAkAudioEvent>(nullptr, TEXT("/Game/WwiseAudio/Events/Ambience/Play_Amb_room.Play_Amb_room"));
                 Test->TestFalse(TEXT("Last event lease released"), System->IsEventDataResident(Event));
-                TArray<UAkComponent*> Emitters; Building->GetOwner()->GetComponents(Emitters);
-                Test->TestEqual(TEXT("Exit removes transient emitter"), Emitters.Num(), 0);
+                Test->TestTrue(TEXT("Exit retains the registered emitter with Tick disabled"),
+                    EmitterWeakPtr.IsValid() && EmitterWeakPtr->IsRegistered()
+                        && !EmitterWeakPtr->IsComponentTickEnabled());
             }
             if (Step == 4)
             {
                 Test->TestTrue(TEXT("Re-entry starts a new live post"), Building->GetPlayingID() != 0 && Building->GetPlayingID() != FirstID && Building->IsPlaying());
+                Test->TestTrue(TEXT("Re-entry uses the same emitter and restores Tick"),
+                    EmitterWeakPtr.IsValid() && EmitterWeakPtr->IsComponentTickEnabled()
+                        && FindEmitter(Building->GetPlayingID()) == EmitterWeakPtr.Get());
                 LastID = Building->GetPlayingID();
                 if (const auto* Event = Building->BuildingEvent.Get()) EventID = Event->GetShortID();
                 Building->GetOwner()->Destroy();
@@ -101,14 +117,23 @@ namespace
             ++Step; Since = World->GetTimeSeconds(); return false;
         }
     private:
+        static UAkComponent* FindEmitter(int32 InPlayingID)
+        {
+            const AkGameObjectID ID =
+                IWwiseSoundEngineAPI::Get()->Query->GetGameObjectFromPlayingID(InPlayingID);
+            return ID == AK_INVALID_GAME_OBJECT ? nullptr : UAkComponent::GetAkComponent(ID);
+        }
+
         FAutomationTestBase* Test;
         TWeakObjectPtr<UWandererBuildingAmbienceComponent> Building;
+        TWeakObjectPtr<UAkComponent> EmitterWeakPtr;
         double Deadline;
         float Since = 0;
         int32 Step = -1;
         int32 FirstID = 0;
         uint32 LastID = 0;
         uint32 EventID = 0;
+        bool bObservedTailLease = false;
     };
 }
 
@@ -123,7 +148,9 @@ bool FBuildingAmbiencePlaybackTest::RunTest(const FString& Parameters)
     World->SpawnActor<AWandererWorldAudioBudget>();
     const auto Rooms = CreateBuildingProbeRooms(*World, Event);
     if (Rooms.Num() != 2) return false;
-    if (!UAudioAuthoringLibrary::CreateBuildingAmbience(Rooms, TEXT("TestBuilding"), Event)) return false;
+    auto* Building = UAudioAuthoringLibrary::CreateBuildingAmbience(Rooms, TEXT("TestBuilding"), Event);
+    if (!Building) return false;
+    Building->ReverbTailHoldSec = .75f;
     ADD_LATENT_AUTOMATION_COMMAND(FStartPIECommand(false));
     ADD_LATENT_AUTOMATION_COMMAND(FBuildingPlaybackProbe(this));
     ADD_LATENT_AUTOMATION_COMMAND(FEndPlayMapCommand());

@@ -5,7 +5,6 @@
 #include "Engine/World.h"
 #include "Misc/ScopeExit.h"
 
-#include "AkAudioDevice.h"
 #include "AkAudioEvent.h"
 #include "AkComponent.h"
 #include "AkRoomComponent.h"
@@ -15,6 +14,7 @@
 #include "Core/Diagnostics/DiagnosticRecorder.h"
 #include "Core/Diagnostics/DiagnosticTraceScope.h"
 #include "Data/Audio/WorldAudioPlaybackData.h"
+#include "Interfaces/Audio/AudioPlaybackService.h"
 #include "Systems/Audio/WandererAudioSubsystem.h"
 
 FString UWandererAudioSourceComponent::GetActiveEventName() const
@@ -24,9 +24,7 @@ FString UWandererAudioSourceComponent::GetActiveEventName() const
 
 bool UWandererAudioSourceComponent::IsPlaying() const
 {
-    FAkAudioDevice* Device = FAkAudioDevice::Get();
-    return PlayingID && LoadedEvent && FAkAudioDevice::IsInitialized() && Device
-           && Device->IsPlayingIDActive(LoadedEvent->GetShortID(), PlayingID);
+    return WandererAudioPlayback::IsPlaybackActive(LoadedEvent, PlayingID);
 }
 
 bool UWandererAudioSourceComponent::TryGetPlaybackPosition(FVector& OutPosition) const
@@ -45,6 +43,18 @@ bool UWandererAudioSourceComponent::GetDebugPlaybackPosition(FVector& OutPositio
     return TryGetPlaybackPosition(OutPosition);
 }
 
+bool UWandererAudioSourceComponent::PrepareForAdmission(bool bInNight)
+{
+    const FWandererWorldAudioProfileRow* Row = GetProfile();
+    if (!Row)
+    {
+        return false;
+    }
+    const TSoftObjectPtr<UAkAudioEvent>& Desired =
+        bInNight && !Row->NightPlayEvent.IsNull() ? Row->NightPlayEvent : Row->PlayEvent;
+    return IsPlaying() || PrepareEvent(Desired);
+}
+
 void UWandererAudioSourceComponent::UpdatePlayback(bool bInAdmitted, FName InReason, bool bInNight)
 {
 #if !UE_BUILD_SHIPPING
@@ -55,7 +65,8 @@ void UWandererAudioSourceComponent::UpdatePlayback(bool bInAdmitted, FName InRea
     };
 #endif
     const FWandererWorldAudioProfileRow* Row = GetProfile();
-    if (!FAkAudioDevice::IsInitialized())
+    const UWorld* World = GetWorld();
+    if (!World || !WandererAudioPlayback::IsReady(*World))
     {
         ShutdownPlayback();
         Status = TEXT("Audio unavailable");
@@ -63,7 +74,7 @@ void UWandererAudioSourceComponent::UpdatePlayback(bool bInAdmitted, FName InRea
     }
     if (PlayingID && !IsPlaying())
     {
-        ReleaseEvent();
+        RequestStop(0);
     }
     if (!bInAdmitted || !Row)
     {
@@ -84,9 +95,10 @@ void UWandererAudioSourceComponent::UpdatePlayback(bool bInAdmitted, FName InRea
     {
         return;
     }
-    if (bStopping)
+    const UWandererAudioSubsystem* System = World->GetSubsystem<UWandererAudioSubsystem>();
+    if (System && System->HasPendingEmitterRelease(*this))
     {
-        Status = TEXT("Finishing fade");
+        Status = TEXT("Finishing fade or reverb tail");
         return;
     }
     if (PlayingID)
@@ -102,15 +114,7 @@ void UWandererAudioSourceComponent::UpdatePlayback(bool bInAdmitted, FName InRea
 
 void UWandererAudioSourceComponent::ShutdownPlayback()
 {
-    // Force-stop even if a previous fade is pending before releasing media.
-    if (PlayingID && FAkAudioDevice::IsInitialized())
-    {
-        if (FAkAudioDevice* Device = FAkAudioDevice::Get())
-        {
-            Device->StopPlayingID(PlayingID, 0);
-        }
-    }
-    ReleaseEvent();
+    RequestStop(0);
     Status = TEXT("Stopped / unloaded");
 }
 
@@ -118,7 +122,8 @@ void UWandererAudioSourceComponent::ReleaseEvent()
 {
     if (bOwnsResourceLease && LoadedEvent)
     {
-        if (UWandererAudioSubsystem* System = GetWorld()->GetSubsystem<UWandererAudioSubsystem>())
+        UWorld* World = GetWorld();
+        if (UWandererAudioSubsystem* System = World ? World->GetSubsystem<UWandererAudioSubsystem>() : nullptr)
         {
             System->ReleaseEventResource(LoadedEvent);
         }
@@ -134,29 +139,20 @@ void UWandererAudioSourceComponent::ReleaseEvent()
     PlayingID = 0;
     PostedObjectWeakPtr.Reset();
     AppliedAreaPresence = -1;
-    bStopping = false;
 }
 
 void UWandererAudioSourceComponent::RequestStop(int32 InFadeMs)
 {
-    if (PlayingID && !bStopping && FAkAudioDevice::IsInitialized())
+    UWorld* World = GetWorld();
+    UWandererAudioSubsystem* System = World ? World->GetSubsystem<UWandererAudioSubsystem>() : nullptr;
+    if (System && (PlayingID || OwnedEmitter))
     {
-        if (FAkAudioDevice* Device = FAkAudioDevice::Get())
-        {
-            WANDERER_DIAGNOSTIC(
-                this,
-                EDiagnosticDomain::Audio,
-                TEXT("stop-request"),
-                false,
-                FString::Printf(TEXT("playingID=%u fadeMs=%d"), PlayingID, InFadeMs));
-            Device->StopPlayingID(PlayingID, InFadeMs);
-        }
-        bStopping = InFadeMs > 0;
+        System->ReleaseEmitter(*this, OwnedEmitter, LoadedEvent, PlayingID, InFadeMs,
+            PostedTailSec, PostedResourceGroup, bOwnsResourceLease, bPreferPreviousEmitter);
+        bOwnsResourceLease = false;
+        OwnedEmitter = nullptr;
     }
-    if (!bStopping || !IsPlaying())
-    {
-        ReleaseEvent();
-    }
+    ReleaseEvent();
 }
 
 bool UWandererAudioSourceComponent::TryStopForPlaybackChange(
@@ -179,12 +175,11 @@ bool UWandererAudioSourceComponent::TryStopForPlaybackChange(
 
 void UWandererAudioSourceComponent::UpdatePlayingEvent()
 {
+    UpdateOwnedEmitter();
     if (UAkGameObject* Object = GetPlaybackObject())
     {
-        Object->SetRTPCValue(nullptr,
-                             EffectivePriority,
-                             WorldAudioPlayback::PriorityInterpolationMs,
-                             TEXT("WorldAudio_Priority"));
+        WandererAudioPlayback::SetWorldEmitterParameter(*Object, EWorldAudioEmitterParameter::Priority,
+            EffectivePriority, WorldAudioPlayback::PriorityInterpolationMs);
     }
     Status = bProtected ? TEXT("Posted / Protected") : TEXT("Posted (physical/virtual: Wwise)");
 }
@@ -199,7 +194,9 @@ bool UWandererAudioSourceComponent::PrepareEvent(const TSoftObjectPtr<UAkAudioEv
     {
         return false;
     }
-    if (GetWorld()->GetTimeSeconds() - LoadStartedAtSec > WorldAudioPlayback::MediaTimeoutSec)
+    const UWandererAudioSubsystem* Audio = GetWorld()->GetSubsystem<UWandererAudioSubsystem>();
+    if ((!Audio || !Audio->IsEventDataResident(LoadedEvent))
+        && GetWorld()->GetTimeSeconds() - LoadStartedAtSec > WorldAudioPlayback::MediaTimeoutSec)
     {
         ReleaseEvent();
         RetryAtSec = GetWorld()->GetTimeSeconds() + WorldAudioPlayback::TimeoutRetryDelaySec;
@@ -226,11 +223,11 @@ bool UWandererAudioSourceComponent::PrepareEvent(const TSoftObjectPtr<UAkAudioEv
         WorldAudioDiagnosticUtils::ReportResourceFailure(this, InDesired.ToSoftObjectPath());
         return false;
     }
-    if (!LoadedEvent->bAutoLoad && !bOwnsResourceLease && !TryAcquireEventLease(InDesired))
+    if (!LoadedEvent->bAutoLoad && !TryAcquireEventLease(InDesired))
     {
         return false;
     }
-    if (!LoadedEvent->IsLoaded() || !LoadedEvent->IsDataFullyLoaded())
+    if (!Audio || !Audio->IsEventDataResident(LoadedEvent))
     {
         Status = TEXT("Loading Wwise media");
         return false;
@@ -243,7 +240,8 @@ bool UWandererAudioSourceComponent::TryStartEventAssetLoad(
 {
     RequestedEvent = InDesired.ToSoftObjectPath();
     LoadStartedAtSec = GetWorld()->GetTimeSeconds();
-    LoadHandle = UAssetManager::GetStreamableManager().RequestAsyncLoad(RequestedEvent);
+    LoadHandle = UAssetManager::GetStreamableManager().RequestAsyncLoad(
+        RequestedEvent, FStreamableDelegate(), FMath::RoundToInt(EffectivePriority));
     if (LoadHandle)
     {
         return true;
@@ -260,12 +258,24 @@ bool UWandererAudioSourceComponent::TryAcquireEventLease(
     const TSoftObjectPtr<UAkAudioEvent>& InDesired)
 {
     UWandererAudioSubsystem* System = GetWorld()->GetSubsystem<UWandererAudioSubsystem>();
-    bOwnsResourceLease = System && System->AcquireEventResource(LoadedEvent);
-    if (bOwnsResourceLease)
+    if (!bOwnsResourceLease)
+    {
+        bOwnsResourceLease = System && System->AcquireEventResource(LoadedEvent);
+    }
+    const EAudioEventResourceStatus LoadStatus = bOwnsResourceLease && System
+        ? System->AdvanceEventResource(LoadedEvent, EffectivePriority)
+        : EAudioEventResourceStatus::Failed;
+    if (LoadStatus == EAudioEventResourceStatus::Ready)
     {
         return true;
     }
+    if (LoadStatus == EAudioEventResourceStatus::Pending)
+    {
+        Status = TEXT("Loading Wwise media");
+        return false;
+    }
 
+    ReleaseEvent();
     Status = TEXT("Managed event resource load failed");
     WorldAudioDiagnosticUtils::ReportResourceFailure(this, InDesired.ToSoftObjectPath());
     RetryAtSec = GetWorld()->GetTimeSeconds() + WorldAudioPlayback::PlaybackRetryDelaySec;
@@ -274,13 +284,27 @@ bool UWandererAudioSourceComponent::TryAcquireEventLease(
 
 void UWandererAudioSourceComponent::StartPreparedEvent()
 {
-    UAkGameObject* Object = GetPlaybackObject();
-    if (!Object || !LoadedEvent)
+    const UWandererAudioSubsystem* AudioSystem = GetWorld()->GetSubsystem<UWandererAudioSubsystem>();
+    if (AudioSystem && !AudioSystem->CanStartWorldPlayback())
     {
-        Status = TEXT("Playback object unavailable");
+        Status = TEXT("Waiting for transition capacity");
         return;
     }
-    Object->SetRTPCValue(nullptr, EffectivePriority, 0, TEXT("WorldAudio_Priority"));
+    UAkGameObject* Object = AcquirePlaybackObject();
+    if (!Object || !LoadedEvent)
+    {
+        Status = TEXT("Playback target or emitter pool unavailable");
+        return;
+    }
+    WandererAudioPlayback::SetWorldEmitterParameter(*Object, EWorldAudioEmitterParameter::Priority,
+        EffectivePriority, 0);
+    if (OwnedEmitter)
+    {
+        if (UWandererAudioSubsystem* System = GetWorld()->GetSubsystem<UWandererAudioSubsystem>())
+        {
+            System->ApplyEmitterReverb(*OwnedEmitter, OwnedEmitter->bUseReverbVolumes);
+        }
+    }
     PreparePlaybackObject(Object);
     WANDERER_DIAGNOSTIC(this,
                         EDiagnosticDomain::Audio,
@@ -291,7 +315,11 @@ void UWandererAudioSourceComponent::StartPreparedEvent()
                                         *Profile.RowName.ToString(),
                                         *GetPathNameSafe(Object),
                                         EffectivePriority));
-    PlayingID = Object->PostAkEvent(LoadedEvent, 0, nullptr, nullptr);
+    UWandererAudioSubsystem* Audio = GetWorld()->GetSubsystem<UWandererAudioSubsystem>();
+    PostedResourceGroup = ResourceGroup;
+    const FWandererWorldAudioProfileRow* PlaybackRow = GetProfile();
+    PlayingID = Audio ? Audio->PostPreparedEvent(
+        *LoadedEvent, Object, PlaybackRow ? PlaybackRow->FadeInSec : 0) : 0;
     WANDERER_DIAGNOSTIC(this,
                         EDiagnosticDomain::Audio,
                         TEXT("wwise-post-result"),
@@ -312,9 +340,16 @@ void UWandererAudioSourceComponent::StartPreparedEvent()
                TEXT("WorldAudio %s: Post failed for %s"),
                *GetNameSafe(GetOwner()),
                *GetNameSafe(LoadedEvent));
+        RequestStop(0);
     }
     else
     {
+        const FWandererWorldAudioProfileRow* Row = GetProfile();
+        PostedTailSec = Row ? Row->ReverbTailHoldSec : 0;
+        if (UAkComponent* Emitter = Cast<UAkComponent>(Object))
+        {
+            Emitter->SetComponentTickEnabled(true);
+        }
         PostedObjectWeakPtr = Object;
         PlaybackStarted(Object);
         Status = TEXT("Posted (physical/virtual: Wwise)");

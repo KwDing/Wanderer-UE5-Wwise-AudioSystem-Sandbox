@@ -2,6 +2,7 @@
 
 #include "DrawDebugHelpers.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/StreamableManager.h"
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
 #include "Templates/UnrealTemplate.h"
@@ -38,6 +39,11 @@ void ARadioInventoryActor::EndPlay(const EEndPlayReason::Type InEndPlayReason)
         ModelWeakPtr->UnregisterProvider(this);
     }
     SetRadioPreviewEnabled(false);
+    if (MeshRequest)
+    {
+        MeshRequest->CancelHandle();
+        MeshRequest.Reset();
+    }
     StopPairPlayback();
 
     CancelPlacement();
@@ -49,6 +55,7 @@ void ARadioInventoryActor::EndPlay(const EEndPlayReason::Type InEndPlayReason)
         }
     }
     SourcesWeakPtrs.Empty();
+    ReturnedDeviceIDs.Reset();
     SelectedSourceWeakPtr.Reset();
     DismissedSourceWeakPtr.Reset();
     RadioMesh = nullptr;
@@ -59,6 +66,7 @@ void ARadioInventoryActor::EndPlay(const EEndPlayReason::Type InEndPlayReason)
 void ARadioInventoryActor::Tick(float InDeltaTime)
 {
     Super::Tick(InDeltaTime);
+    UpdateSpeakerMeshes();
     UpdatePairPlayback(InDeltaTime);
     if (!IsGameplayReady())
     {
@@ -159,10 +167,11 @@ bool ARadioInventoryActor::RetrieveAllSources()
         {
             if (SourceWeakPtr.IsValid())
             {
-                SourceWeakPtr->Destroy();
+                ReturnDeviceToInventory(*SourceWeakPtr);
             }
         }
     }
+    UpdatePairPlayback(0);
     Status =
         TEXT("Playback paused. All devices retrieved; place a device and press Play to resume.");
     LogRecorderAction(TEXT("RetrieveAll"), TEXT("Accepted"), PreviousState, Status);
@@ -192,7 +201,7 @@ bool ARadioInventoryActor::RetrieveSource(AWandererSpeakerActor* InSource)
         });
     {
         TGuardValue<bool> Guard(bPublishingIntent, true);
-        InSource->Destroy();
+        ReturnDeviceToInventory(*InSource);
     }
     if (GetSources().IsEmpty())
     {
@@ -202,6 +211,16 @@ bool ARadioInventoryActor::RetrieveSource(AWandererSpeakerActor* InSource)
     Status = TEXT("Retrieved. A source slot is available again.");
     LogRecorderAction(TEXT("Retrieve"), TEXT("Accepted"), PreviousState, Status);
     return true;
+}
+
+void ARadioInventoryActor::ReturnDeviceToInventory(AWandererSpeakerActor& InSource)
+{
+    if (InSource.GetEmitterHandle().IsSet())
+    {
+        ReturnedDeviceIDs.FindOrAdd(InSource.GetItemType()).Add(InSource.GetEmitterHandle().InstanceID);
+    }
+    InSource.WithdrawAudioEmitter();
+    InSource.Destroy();
 }
 
 void ARadioInventoryActor::SetInteractionOpen(bool bInOpen)
@@ -364,9 +383,11 @@ bool ARadioInventoryActor::TogglePlaybackRequest()
     bool bSuccess = false;
     if (Source->IsPlaybackRequested())
     {
-        SetSourceIntent(*Source, Source->GetOptionID(), false);
-        bSuccess = UpdatePairPlayback(0);
-        Status = TEXT("Selected device paused. Other devices keep their state.");
+        bSuccess = PausePairPlayback();
+        if (bSuccess)
+        {
+            Status = TEXT("All radio playback paused.");
+        }
     }
     else
     {

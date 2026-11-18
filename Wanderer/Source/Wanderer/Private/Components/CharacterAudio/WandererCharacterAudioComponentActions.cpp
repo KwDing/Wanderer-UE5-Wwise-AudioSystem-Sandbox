@@ -2,7 +2,6 @@
 
 #include "Engine/World.h"
 
-#include "AkAudioDevice.h"
 #include "AkAudioEvent.h"
 #include "AkComponent.h"
 #include "AkGroupValue.h"
@@ -10,28 +9,15 @@
 #include "AkStateValue.h"
 #include "AkSwitchValue.h"
 #include "AkTrigger.h"
-#include "Wwise/API/WwiseSoundEngineAPI.h"
 
 #include "Components/CharacterAudio/CharacterAudioActionUtils.h"
 #include "Components/CharacterAudio/CharacterAudioDiagnosticUtils.h"
-#include "Core/Diagnostics/DiagnosticRecorder.h"
 #include "Core/Diagnostics/DiagnosticTraceScope.h"
-#include "Systems/Audio/WandererAudioDiagnostics.h"
+#include "Interfaces/Audio/AudioPlaybackService.h"
 
 namespace
 {
     using namespace WandererCharacterActions;
-    struct FPreparedAudioAction
-    {
-        const FWandererAudioAction* Definition = nullptr;
-        UAkComponent* Target = nullptr; // Synchronous game-thread observation only.
-        uint32 ObjectID = 0;
-        uint32 GroupID = 0;
-        float Value = 0.0f;
-        AkGameObjectID GameObjectID = AK_INVALID_GAME_OBJECT;
-        AkPlayingID ExistingPlayingID = AK_INVALID_PLAYING_ID;
-    };
-
     using FPreparedAudioActions = TArray<FPreparedAudioAction, TInlineAllocator<8>>;
 
     bool IsGlobalAudioAction(const FWandererAudioAction& AudioAction)
@@ -108,7 +94,7 @@ namespace
         }
     }
 
-    const UAkGroupValue* ResolveSwitch(const FWandererAudioAction& AudioAction,
+    UAkGroupValue* ResolveSwitch(const FWandererAudioAction& AudioAction,
         const FWandererCharacterAudioContext& Context,
         const FSurfaceValues& Surfaces)
     {
@@ -134,7 +120,7 @@ namespace
         return Value ? Value->Get() : nullptr;
     }
 
-    const UAkGroupValue* ResolveGroup(const FWandererAudioAction& AudioAction,
+    UAkGroupValue* ResolveGroup(const FWandererAudioAction& AudioAction,
         const FWandererCharacterAudioContext& Context,
         const FSurfaceValues& Surfaces)
     {
@@ -154,83 +140,52 @@ namespace
         return Value ? Value->Get() : nullptr;
     }
 
-    bool PrepareParameter(
-        FPreparedAudioAction& Prepared, const FWandererCharacterAudioContext& Context)
+    bool PrepareAudioAction(const FWandererAudioAction& InAction,
+        const FWandererCharacterAudioContext& InContext,
+        UAkComponent* InOwnerEmitter,
+        const FSurfaceValues& InSurfaces,
+        FPreparedAudioAction& OutAction)
     {
-        const FWandererAudioAction& AudioAction = *Prepared.Definition;
-        using EType = EWandererAudioActionType;
-        if (!IsValid(AudioAction.Parameter))
+        if (!IsGlobalAudioAction(InAction) && !IsValid(InOwnerEmitter))
         {
             return false;
         }
-        Prepared.ObjectID = AudioAction.Parameter->GetShortID();
-        if (AudioAction.Scope == EWandererAudioParameterScope::ExistingPlayback)
-        {
-            if (Context.ExistingPlayingID <= 0 || Context.ExistingPlayingID > MAX_uint32)
-            {
-                return false;
-            }
-            Prepared.ExistingPlayingID = static_cast<AkPlayingID>(Context.ExistingPlayingID);
-            auto* SoundEngine = IWwiseSoundEngineAPI::Get();
-            if (!SoundEngine || !SoundEngine->Query
-                || SoundEngine->Query->GetGameObjectFromPlayingID(Prepared.ExistingPlayingID)
-                       != Prepared.GameObjectID)
-            {
-                return false;
-            }
-        }
-        return Prepared.ObjectID
-               && (AudioAction.AudioActionType != EType::SetParameter
-                   || ResolveNumber(AudioAction, Context, Prepared.Value));
-    }
-
-    bool PrepareAudioAction(FPreparedAudioAction& Prepared,
-        const FWandererCharacterAudioContext& Context,
-        UAkComponent* OwnerEmitter,
-        const FSurfaceValues& Surfaces)
-    {
-        const FWandererAudioAction& AudioAction = *Prepared.Definition;
-        Prepared.Target = AudioAction.Target == EWandererAudioTarget::Owner
-                              ? OwnerEmitter
-                              : Context.TargetEmitter.Get();
-        if (!IsGlobalAudioAction(AudioAction))
-        {
-            if (!IsValid(Prepared.Target) || !Prepared.Target->IsRegistered()
-                || !Prepared.Target->IsRegisteredWithWwise() || !IsValid(OwnerEmitter)
-                || Prepared.Target->GetWorld() != OwnerEmitter->GetWorld())
-            {
-                return false;
-            }
-            Prepared.GameObjectID = Prepared.Target->GetAkGameObjectID();
-            if (!Prepared.GameObjectID || Prepared.GameObjectID == AK_INVALID_GAME_OBJECT)
-            {
-                return false;
-            }
-        }
+        OutAction.ActionID = InAction.AudioActionID;
+        OutAction.Type = InAction.AudioActionType;
+        OutAction.Scope = InAction.Scope;
+        OutAction.TargetWeakPtr = InAction.Target == EWandererAudioTarget::Owner
+            ? InOwnerEmitter : InContext.TargetEmitter.Get();
         using EType = EWandererAudioActionType;
-        if (IsParameterAudioAction(AudioAction))
+        if (IsParameterAudioAction(InAction))
         {
-            return PrepareParameter(Prepared, Context);
-        }
-        if (AudioAction.AudioActionType == EType::SetSwitch
-            || AudioAction.AudioActionType == EType::SetState)
-        {
-            const UAkGroupValue* Value = ResolveGroup(AudioAction, Context, Surfaces);
-            if (!IsValid(Value))
+            OutAction.AssetWeakPtr = InAction.Parameter.Get();
+            if (InAction.Scope == EWandererAudioParameterScope::ExistingPlayback)
             {
-                return false;
+                if (InContext.ExistingPlayingID <= 0 || InContext.ExistingPlayingID > MAX_uint32)
+                {
+                    return false;
+                }
+                OutAction.ExistingPlayingID = static_cast<uint32>(InContext.ExistingPlayingID);
             }
-            Prepared.ObjectID = Value->GetShortID();
-            Prepared.GroupID = Value->GetGroupID();
-            return Prepared.ObjectID && Prepared.GroupID;
+            return InAction.AudioActionType != EType::SetParameter
+                || ResolveNumber(InAction, InContext, OutAction.Value);
         }
-        if (AudioAction.AudioActionType == EType::PostTrigger)
+        switch (InAction.AudioActionType)
         {
-            Prepared.ObjectID =
-                IsValid(AudioAction.Trigger) ? AudioAction.Trigger->GetShortID() : 0;
-            return Prepared.ObjectID != 0;
+        case EType::SetSwitch:
+        case EType::SetState:
+            OutAction.AssetWeakPtr = ResolveGroup(InAction, InContext, InSurfaces);
+            break;
+        case EType::PostTrigger:
+            OutAction.AssetWeakPtr = InAction.Trigger.Get();
+            break;
+        case EType::PostEvent:
+            OutAction.AssetWeakPtr = InAction.Event.Get();
+            break;
+        default:
+            return false;
         }
-        return AudioAction.AudioActionType == EType::PostEvent && IsValid(AudioAction.Event);
+        return OutAction.AssetWeakPtr.IsValid();
     }
 
     bool PrepareAudioActions(const TArray<FWandererAudioAction>& InActions,
@@ -243,8 +198,7 @@ namespace
         for (const FWandererAudioAction& AudioAction : InActions)
         {
             FPreparedAudioAction& Item = Prepared.AddDefaulted_GetRef();
-            Item.Definition = &AudioAction;
-            if (!PrepareAudioAction(Item, Context, InEmitter, InSurfaces))
+            if (!PrepareAudioAction(AudioAction, Context, InEmitter, InSurfaces, Item))
             {
                 OutError = FString::Printf(
                     TEXT("%s: missing context/mapping, invalid target, or expired PlayingID."),
@@ -255,137 +209,6 @@ namespace
         return true;
     }
 
-    AKRESULT SendAudioAction(IWwiseSoundEngineAPI& SoundEngine,
-        const FPreparedAudioAction& Prepared,
-        AkPlayingID& OutPlayingID)
-    {
-        const FWandererAudioAction& AudioAction = *Prepared.Definition;
-        using EType = EWandererAudioActionType;
-        using EScope = EWandererAudioParameterScope;
-        switch (AudioAction.AudioActionType)
-        {
-        case EType::PostEvent:
-            OutPlayingID = Prepared.Target->PostAkEvent(AudioAction.Event.Get());
-            return OutPlayingID != AK_INVALID_PLAYING_ID ? AK_Success : AK_Fail;
-        case EType::SetParameter:
-            if (AudioAction.Scope == EScope::ExistingPlayback)
-            {
-                return SoundEngine.SetRTPCValueByPlayingID(
-                    Prepared.ObjectID, Prepared.Value, Prepared.ExistingPlayingID);
-            }
-            return SoundEngine.SetRTPCValue(Prepared.ObjectID,
-                Prepared.Value,
-                Prepared.GameObjectID,
-                0,
-                AkCurveInterpolation_Linear,
-                AudioAction.Scope == EScope::ThisExecution);
-        case EType::SetSwitch:
-            return SoundEngine.SetSwitch(
-                Prepared.GroupID, Prepared.ObjectID, Prepared.GameObjectID);
-        case EType::SetState:
-            return SoundEngine.SetState(Prepared.GroupID, Prepared.ObjectID);
-        case EType::PostTrigger:
-            return SoundEngine.PostTrigger(Prepared.ObjectID, Prepared.GameObjectID);
-        case EType::ResetParameter:
-            if (AudioAction.Scope == EScope::ExistingPlayback)
-            {
-                return SoundEngine.ResetRTPCValueByPlayingID(
-                    Prepared.ObjectID, Prepared.ExistingPlayingID);
-            }
-            return SoundEngine.ResetRTPCValue(Prepared.ObjectID, Prepared.GameObjectID);
-        default:
-            return AK_Fail;
-        }
-    }
-
-    bool PinSnapshot(IWwiseSoundEngineAPI& SoundEngine,
-        const FPreparedAudioAction& Prepared,
-        AkPlayingID PlayingID)
-    {
-        const FWandererAudioAction& AudioAction = *Prepared.Definition;
-        if (AudioAction.AudioActionType != EWandererAudioActionType::SetParameter
-            || AudioAction.Scope != EWandererAudioParameterScope::ThisExecution)
-        {
-            return true;
-        }
-        return SoundEngine.SetRTPCValueByPlayingID(Prepared.ObjectID,
-                   Prepared.Value,
-                   PlayingID,
-                   0,
-                   AkCurveInterpolation_Linear,
-                   true)
-               == AK_Success;
-    }
-
-    void ReportSdkResult(const FPreparedAudioAction& Item, AKRESULT Code, AkPlayingID PlayingID)
-    {
-        WANDERER_DIAGNOSTIC(Item.Target,
-            EDiagnosticDomain::Audio,
-            TEXT("wwise-action-result"),
-            Code != AK_Success,
-            FString::Printf(
-                TEXT("action=%s type=%d event=%s objectID=%u groupID=%u "
-                     "value=%.3f gameObjectID=%llu result=%d playingID=%u positionCm=%s"),
-                *Item.Definition->AudioActionID.ToString(),
-                static_cast<int32>(Item.Definition->AudioActionType),
-                *GetPathNameSafe(Item.Definition->Event.Get()),
-                Item.ObjectID,
-                Item.GroupID,
-                Item.Value,
-                Item.GameObjectID,
-                static_cast<int32>(Code),
-                PlayingID,
-                Item.Target ? *Item.Target->GetComponentLocation().ToCompactString()
-                            : TEXT("global")));
-    }
-
-    FWandererAudioExecutionResult SendPreparedAudioActions(
-        IWwiseSoundEngineAPI& SoundEngine, const FPreparedAudioActions& Prepared)
-    {
-        FWandererAudioExecutionResult Result;
-        for (const FPreparedAudioAction& Item : Prepared)
-        {
-            AkPlayingID PlayingID = AK_INVALID_PLAYING_ID;
-            const AKRESULT Code = SendAudioAction(SoundEngine, Item, PlayingID);
-            ReportSdkResult(Item, Code, PlayingID);
-            if (Code != AK_Success)
-            {
-                Result.Status = Result.AcceptedAudioActions
-                                    ? EWandererAudioExecutionStatus::PartialFailure
-                                    : EWandererAudioExecutionStatus::Failed;
-                Result.Message = FString::Printf(
-                    TEXT("%s: Wwise result=%d; previous accepted audio actions are not "
-                         "rolled back."),
-                    *Item.Definition->AudioActionID.ToString(),
-                    static_cast<int32>(Code));
-                return Result;
-            }
-            ++Result.AcceptedAudioActions;
-            if (PlayingID == AK_INVALID_PLAYING_ID)
-            {
-                continue;
-            }
-            Result.PlayingID = PlayingID;
-            for (const FPreparedAudioAction& Snapshot : Prepared)
-            {
-                if (PinSnapshot(SoundEngine, Snapshot, PlayingID))
-                {
-                    continue;
-                }
-                if (FAkAudioDevice* Device = FAkAudioDevice::Get())
-                {
-                    Device->StopPlayingID(PlayingID);
-                }
-                Result.Status = EWandererAudioExecutionStatus::PartialFailure;
-                Result.PlayingID = 0;
-                Result.Message = TEXT("Snapshot failed; stopped only the new Event. Earlier "
-                                      "parameter/state audio actions remain applied.");
-                return Result;
-            }
-        }
-        Result.Status = EWandererAudioExecutionStatus::Accepted;
-        return Result;
-    }
 } // namespace
 
 FWandererAudioExecutionResult UWandererCharacterAudioComponent::ExecuteAction(FName ActionID,
@@ -406,8 +229,7 @@ FWandererAudioExecutionResult UWandererCharacterAudioComponent::ExecuteAction(FN
     FDiagnosticTraceScope Trace(ActionID == TEXT("Footstep"));
     CharacterAudioDiagnosticUtils::ReportRequest(this, ActionID, Context, Scope);
     UWorld* World = GetWorld();
-    if (!bReady || !IsActive() || !IsValid(World) || World->bIsTearingDown
-        || !FAkAudioDevice::IsInitialized())
+    if (!bReady || !IsActive() || !IsValid(World) || !WandererAudioPlayback::IsReady(*World))
     {
         Result.Message = TEXT("Audio not ready/active, World missing, or Wwise unavailable.");
         ReportSkip(ActionID, TEXT("NotReady"), *Result.Message);
@@ -464,10 +286,10 @@ FWandererAudioExecutionResult UWandererCharacterAudioComponent::ExecuteAudioActi
     FWandererAudioExecutionResult Result;
     const TArray<FWandererAudioAction>* AudioActions =
         WandererCharacterActions::GetAudioActions(InRow);
-    IWwiseSoundEngineAPI* SoundEngine = IWwiseSoundEngineAPI::Get();
-    if (!AudioActions || !SoundEngine)
+    const UWorld* World = GetWorld();
+    if (!AudioActions || !IsValid(World))
     {
-        Result.Message = TEXT("AudioAction configuration or sound engine missing.");
+        Result.Message = TEXT("AudioAction configuration or World missing.");
         return Result;
     }
     // Preflight every audio action before the first SDK side effect.
@@ -483,6 +305,10 @@ FWandererAudioExecutionResult UWandererCharacterAudioComponent::ExecuteAudioActi
         WarnOnce(ActionID, *Result.Message);
         return Result;
     }
-    bOutAttempted = true;
-    return SendPreparedAudioActions(*SoundEngine, Prepared);
+    Result = WandererAudioPlayback::ApplyPreparedActions(*World, Prepared, bOutAttempted);
+    if (!bOutAttempted)
+    {
+        WarnOnce(ActionID, *Result.Message);
+    }
+    return Result;
 }

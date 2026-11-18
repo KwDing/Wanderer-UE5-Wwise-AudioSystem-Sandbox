@@ -46,6 +46,9 @@ class WANDERER_API UWandererBuildingAmbienceComponent : public UWandererAudioSou
         Category = "Building",
         meta = (ClampMin = "0", ClampMax = "2", Units = "s", DisplayName = "淡出秒数"))
     float BuildingFadeOutSeconds = .4f;
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Building",
+        meta = (ClampMin = "0", Units = "s"))
+    float ReverbTailHoldSec = 0;
     UPROPERTY(EditAnywhere,
         BlueprintReadWrite,
         Category = "Building",
@@ -56,11 +59,12 @@ class WANDERER_API UWandererBuildingAmbienceComponent : public UWandererAudioSou
     virtual FString ValidateConfiguration() const override;
     virtual bool Evaluate(const FVector& Listener) override;
     virtual bool CollectAudioRoomPaths(TArray<FSoftObjectPath>& OutPaths) const override;
+    virtual const UObject* GetPlaybackIdentity() const override;
     bool ContainsRoom(const AActor* Room) const;
 
   protected:
-    virtual UAkGameObject* GetPlaybackObject() override;
-    virtual void EndPlay(const EEndPlayReason::Type Reason) override;
+    virtual UAkGameObject* GetPlaybackObject() const override;
+    virtual UAkGameObject* AcquirePlaybackObject() override;
     virtual void PreparePlaybackObject(UAkGameObject* Object) override;
     virtual void PlaybackStarted(UAkGameObject* Object) override;
 
@@ -69,6 +73,4 @@ class WANDERER_API UWandererBuildingAmbienceComponent : public UWandererAudioSou
     FString ValidateBuildingOwnership() const;
     mutable FWandererWorldAudioProfileRow PlaybackProfile;
     FVector ListenerPosition = FVector::ZeroVector;
-    UPROPERTY(Transient)
-    TObjectPtr<UAkComponent> BuildingEmitter;
 };

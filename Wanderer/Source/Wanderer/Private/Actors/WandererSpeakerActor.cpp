@@ -6,6 +6,7 @@
 #include "Engine/StaticMesh.h"
 #include "Templates/UnrealTemplate.h"
 
+#include "Components/Audio/WandererObjectAudioComponent.h"
 #include "Data/WandererSpeakerSettings.h"
 
 AWandererSpeakerActor::AWandererSpeakerActor()
@@ -21,11 +22,12 @@ AWandererSpeakerActor::AWandererSpeakerActor()
     Visual->SetLightingChannels(true, false, true);
     EmitterAnchor = CreateDefaultSubobject<USceneComponent>(TEXT("EmitterAnchor"));
     EmitterAnchor->SetupAttachment(PlacementBox);
+    ObjectAudio = CreateDefaultSubobject<UWandererObjectAudioComponent>(TEXT("ObjectAudio"));
 }
 
 void AWandererSpeakerActor::RequestPlayback(FName NewOptionID, bool bRequested)
 {
-    if (bEndingPlay || bPublishingPlayback || IsActorBeingDestroyed()
+    if (bEndingPlay || bPublishingPlayback || IsActorBeingDestroyed() || (bPreview && bRequested)
         || (OptionID == NewOptionID && bPlaybackRequested == bRequested))
     {
         return;
@@ -74,14 +76,41 @@ FVector AWandererSpeakerActor::GetPlacementExtent() const
 
 void AWandererSpeakerActor::SetPreview(bool bInPreview)
 {
+    bPreview = bInPreview;
     PlacementBox->SetCollisionEnabled(
         bInPreview ? ECollisionEnabled::NoCollision : ECollisionEnabled::QueryOnly);
     Visual->SetCastShadow(!bInPreview);
+    if (bPreview)
+    {
+        WithdrawAudioEmitter();
+        RequestPlayback(OptionID, false);
+    }
+}
+
+bool AWandererSpeakerActor::ConfirmAudioPlacement(const FGuid& InInstanceID)
+{
+    if (!ObjectAudio->ActivateEmitter(InInstanceID, EmitterAnchor, false, FTransform::Identity))
+    {
+        return false;
+    }
+    SetPreview(false);
+    return true;
+}
+
+void AWandererSpeakerActor::WithdrawAudioEmitter()
+{
+    ObjectAudio->DeactivateEmitter();
+}
+
+const FObjectAudioEmitterHandle& AWandererSpeakerActor::GetEmitterHandle() const
+{
+    return ObjectAudio->GetEmitterHandle();
 }
 
 void AWandererSpeakerActor::EndPlay(const EEndPlayReason::Type InEndPlayReason)
 {
     bEndingPlay = true;
+    WithdrawAudioEmitter();
     const bool bWasPlaying = bPlaybackRequested;
     bPlaybackRequested = false;
     if (!bPublishingPlayback)

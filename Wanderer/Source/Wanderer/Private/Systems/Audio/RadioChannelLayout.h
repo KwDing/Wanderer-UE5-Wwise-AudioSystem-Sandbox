@@ -11,7 +11,7 @@ public:
     static constexpr int32 SlotCount = 4;
     FRadioChannelLayout(
         const TArray<FRadioEmitterSnapshot>& InSources, FName InContentID, bool bInStereo);
-    int32 GetChannelMask(int32 InSlot) const;
+    ERadioChannel GetChannel(int32 InSlot) const;
     float GetGain() const;
     const FRadioEmitterSnapshot* GetMember(int32 InSlot) const;
     bool HasPlaybackRequest() const

@@ -9,6 +9,7 @@
 #include "WandererMapComponent.generated.h"
 
 class ACharacter;
+class ULevel;
 class UStaticMeshComponent;
 
 /** Bounded top-down cartography plus an independent connected walkable-cell survey. */
@@ -65,12 +66,26 @@ class WANDERER_API UWandererMapComponent : public UActorComponent
     }
 
   protected:
+    virtual void BeginPlay() override;
     virtual void TickComponent(float InDeltaTime,
         ELevelTick InTickType,
         FActorComponentTickFunction* InThisTickFunction) override;
     virtual void EndPlay(const EEndPlayReason::Type InEndPlayReason) override;
 
   private:
+    friend class FMapScanBudgetTest;
+
+    enum class EScanPhase : uint8
+    {
+        Waiting,
+        Seed,
+        Bounds,
+        Survey,
+        Reachable,
+        Entrances,
+        Complete
+    };
+
     UPROPERTY(EditAnywhere, Category = "Wanderer|Map", meta = (ClampMin = "30", ClampMax = "200"))
     float CellSize = 60.0f;
     UPROPERTY(EditAnywhere, Category = "Wanderer|Map", meta = (ClampMin = "1000"))
@@ -85,8 +100,20 @@ class WANDERER_API UWandererMapComponent : public UActorComponent
     float StepHeight = 45.0f;
     float WalkableFloorZ = 0.71f;
     int32 NextCell = 0;
-
-    bool bNeedsScan = true;
+    EScanPhase Phase = EScanPhase::Waiting;
+    bool bLevelSetChanged = false;
+    int32 NextLevel = 0;
+    int32 NextActor = 0;
+    int32 NextComponent = 0;
+    TWeakObjectPtr<AActor> BoundsActorWeakPtr;
+    bool bCollectTrialBounds = false;
+    FBox VisibleBounds = FBox(ForceInit);
+    TArray<TWeakObjectPtr<UStaticMeshComponent>> DoorCandidates;
+    int32 NextDoor = 0;
+    TMap<FInt64Point, TArray<FVector>> EntranceBuckets;
+    double SlowestStepSec = 0;
+    EScanPhase SlowestPhase = EScanPhase::Waiting;
+    int32 OverBudgetFrames = 0;
 
     TArray<TWeakObjectPtr<UStaticMeshComponent>> SurveyWater;
     FCollisionQueryParams SurveyQuery;
@@ -97,15 +124,21 @@ class WANDERER_API UWandererMapComponent : public UActorComponent
 
     FMapScanSnapshot Snapshot;
 
-    bool StartScan(ACharacter& InCharacter);
+    void StartScan(ACharacter& InCharacter);
+    void AdvanceScan(double InDeadline);
+    void AdvanceScanStep();
+    void TrySeedScan();
+    void OnScanLevelChanged(ULevel* InLevel, UWorld* InWorld);
     bool FindFloor(const FVector& InPosition, FVector& OutFloor) const;
     bool CanTraverse(const FVector& InFrom, const FVector& InTo) const;
     void ExpandCell(int32 Index);
     void AddCell(const FVector& InFloor);
-    void FindEntrances();
-    void StartSurvey();
-    void GatherSurveyBounds(FBox& OutVisibleBounds);
-    void GatherSurveyMesh(UStaticMeshComponent& InMesh, FBox& OutVisibleBounds);
+    void AdvanceEntranceScan();
+    void TryAddEntrance(const UStaticMeshComponent& InMesh);
+    void BeginSurveyBounds();
+    void AdvanceSurveyBounds();
+    void FinalizeSurveyBounds();
+    void GatherSurveyMesh(UStaticMeshComponent& InMesh);
     void SampleSurveyCell();
     FName ClassifySurveyHit(const FHitResult& InHit) const;
     bool IsWaterSample(const FVector& InPosition) const;

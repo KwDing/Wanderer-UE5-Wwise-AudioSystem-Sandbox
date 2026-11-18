@@ -26,7 +26,6 @@ AWandererPlayerController::AWandererPlayerController()
     RadioControlModel = CreateDefaultSubobject<URadioControlModel>(TEXT("RadioControlModel"));
     ListenerAudioManager =
         CreateDefaultSubobject<UListenerAudioManager>(TEXT("ListenerAudioManager"));
-    InitializeAudioDefaults();
 }
 
 void AWandererPlayerController::OnUnPossess()
@@ -50,6 +49,7 @@ void AWandererPlayerController::BeginPlay()
         return;
     }
     ObservedGameStateWeakPtr = GetWorld()->GetGameState<AWandererGameState>();
+    PrepareLocalAudio();
     CharacterSelectionModel->Initialize(this, CharacterCatalog);
     if (!IsFrameworkActive())
     {
@@ -124,7 +124,7 @@ void AWandererPlayerController::StopFramework(EEndPlayReason::Type InReason)
     MapComponent->SetComponentTickEnabled(false);
     RadioControlModel->Stop();
     CharacterSelectionModel->Stop();
-    ListenerAudioManager->Stop(MenuResumeEvent);
+    ListenerAudioManager->Stop(nullptr);
     MapAudioEvent.Clear();
     NotifyFeaturesStopped();
     if (StateWeakPtr.IsValid()

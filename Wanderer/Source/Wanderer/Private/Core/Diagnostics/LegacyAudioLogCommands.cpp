@@ -67,7 +67,7 @@ namespace
     FAutoConsoleCommand Master(TEXT("Wanderer.AudioLog"),
         TEXT("Deprecated: Diagnostic.Preset"),
         FConsoleCommandWithArgsAndOutputDeviceDelegate::CreateStatic(&OnMaster));
-    FAutoConsoleCommand Footsteps(TEXT("Wanderer.AudioLog.Footsteps"),
+    FAutoConsoleCommand LegacyFootstepsCommand(TEXT("Wanderer.AudioLog.Footsteps"),
         TEXT("Deprecated: Diagnostic.Footsteps"),
         FConsoleCommandWithArgsAndOutputDeviceDelegate::CreateStatic(&OnFootsteps));
     FAutoConsoleCommand Configuration(TEXT("Wanderer.AudioLog.Configuration"),

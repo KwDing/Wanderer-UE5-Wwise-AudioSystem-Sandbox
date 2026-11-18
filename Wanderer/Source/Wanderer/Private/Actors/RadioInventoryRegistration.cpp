@@ -66,5 +66,5 @@ namespace
             }
         }
     };
-    FRadioInventoryRegistration Registration;
+    FRadioInventoryRegistration RadioInventoryRegistration;
 } // namespace

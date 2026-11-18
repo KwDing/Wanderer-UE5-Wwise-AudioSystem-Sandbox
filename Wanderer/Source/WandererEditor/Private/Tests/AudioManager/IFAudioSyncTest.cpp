@@ -38,6 +38,63 @@ UWandererAudioSourceComponent* GetAudioSource(AActor* Actor)
 }
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIFAudioSyncRevisionTest, "Wanderer.Audio.IFSync.StableRevision",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FIFAudioSyncRevisionTest::RunTest(const FString& Parameters)
+{
+    UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+    AInteriorFitArea* Source = MakeArea(World, TEXT("InteriorFitProof_RevisionTest"), 0);
+    MakeArea(World, TEXT("InteriorFitProof_RevisionOther"), 1000);
+    const auto Service = MakeShared<FInteriorFitAudioSyncService>();
+    Service->Start();
+    Service->PollWorld(*World, 0);
+    TestEqual(TEXT("First sample cannot write"), AudioAreas(World).Num(), 0);
+    Service->PollWorld(*World, 1);
+    TestEqual(TEXT("Both startup samples collected"), Service->SampleCount, 2);
+    TestEqual(TEXT("Stable startup enters Reconcile once"), Service->ReconcileCount, 1);
+    if (!TestEqual(TEXT("Second sample creates both targets"), AudioAreas(World).Num(), 2))
+    {
+        return false;
+    }
+    TestEqual(TEXT("Both groups processed initially"), Service->ReconciledGroupCount, 2);
+    for (int32 Time = 2; Time <= 10; ++Time)
+    {
+        Service->PollWorld(*World, Time);
+    }
+    TestEqual(TEXT("Stable one-second ticks reuse the sample"), Service->SampleCount, 2);
+    Service->PollWorld(*World, 11);
+    TestEqual(TEXT("An identical fallback sample skips Reconcile"), Service->ReconcileCount, 1);
+
+    Source->SetSurfaceCells({FVector(500, 0, 0)});
+    Service->PollWorld(*World, 12);
+    TestEqual(TEXT("Silent plugin cell replacement is still waiting for fallback"), Service->SampleCount, 3);
+    Service->PollWorld(*World, 21);
+    TestEqual(TEXT("A changed fallback sample still needs confirmation"), Service->ReconcileCount, 1);
+    Service->PollWorld(*World, 22);
+    TestEqual(TEXT("Only the changed group reconciles"), Service->ReconciledGroupCount, 3);
+
+    auto Targets = AudioAreas(World);
+    AWandererAudioAreaEmitter** EditedTarget = Targets.FindByPredicate([Source](AWandererAudioAreaEmitter* Target)
+    {
+        return GetAudioSource(Target)->GeometryImportSource == Source->GetPathName();
+    });
+    if (!TestTrue(TEXT("The edited source still has its target"), EditedTarget != nullptr))
+    {
+        return false;
+    }
+    TestTrue(TEXT("Confirmed silent edit copies the new cells"),
+        (*EditedTarget)->GetSurfaceCells()[0].Equals(FVector(500, 0, 0)));
+    (*EditedTarget)->Destroy();
+    Service->PollWorld(*World, 23);
+    TestEqual(TEXT("Target deletion waits for two samples"), AudioAreas(World).Num(), 1);
+    Service->PollWorld(*World, 24);
+    TestEqual(TEXT("Target deletion re-pairs despite unchanged source geometry"), AudioAreas(World).Num(), 2);
+    TestEqual(TEXT("Only the deleted target's group is rebuilt"), Service->ReconciledGroupCount, 4);
+    Service->Stop();
+    return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FIFAudioSyncSingleTest, "Wanderer.Audio.IFSync.Single",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FIFAudioSyncSingleTest::RunTest(const FString& Parameters)

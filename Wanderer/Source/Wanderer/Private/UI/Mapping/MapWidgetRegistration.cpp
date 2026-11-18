@@ -70,5 +70,5 @@ namespace
             }
         }
     };
-    FMapWidgetRegistration Registration;
+    FMapWidgetRegistration MapWidgetRegistration;
 } // namespace

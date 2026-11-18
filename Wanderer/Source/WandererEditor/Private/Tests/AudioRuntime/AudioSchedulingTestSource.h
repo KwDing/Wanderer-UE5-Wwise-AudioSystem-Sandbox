@@ -28,14 +28,16 @@ class UAudioSchedulingTestSource : public UObject, public IAudioSourceInterface
     int32 UpdateCount = 0;
     bool bAdmitted = false;
     bool bNight = false;
+    bool bMediaReady = true;
 
     virtual UWorld* GetWorld() const override;
     virtual bool Evaluate(const FVector& InListener) override;
     virtual FAudioSchedulingInfo GetSchedulingInfo() const override;
     virtual FName GetAudioResourceGroup() const override;
     virtual int32 GetPlayingID() const override;
-    virtual UObject* GetPlaybackIdentity() override;
+    virtual const UObject* GetPlaybackIdentity() const override;
     virtual bool CollectAudioRoomPaths(TArray<FSoftObjectPath>& OutPaths) const override;
+    virtual bool PrepareForAdmission(bool bInNight) override;
     virtual void UpdatePlayback(bool bInAdmitted, FName InReason, bool bInNight) override;
     virtual void ShutdownPlayback() override;
 };

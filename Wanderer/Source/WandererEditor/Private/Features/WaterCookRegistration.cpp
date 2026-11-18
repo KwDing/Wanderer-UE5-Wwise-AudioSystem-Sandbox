@@ -25,6 +25,6 @@ namespace
         CookHandle.Reset();
     }
 
-    FEditorFeatureRegistration Registration(
+    FEditorFeatureRegistration WaterCookFeatureRegistration(
         TEXT("WaterCooking"), &StartWaterCooking, &StopWaterCooking, true);
 } // namespace

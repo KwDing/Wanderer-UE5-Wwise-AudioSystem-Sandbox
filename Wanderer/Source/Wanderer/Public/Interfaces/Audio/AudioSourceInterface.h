@@ -23,8 +23,11 @@ class WANDERER_API IAudioSourceInterface
     virtual FAudioSchedulingInfo GetSchedulingInfo() const = 0;
     virtual FName GetAudioResourceGroup() const = 0;
     virtual int32 GetPlayingID() const = 0;
-    virtual UObject* GetPlaybackIdentity() = 0;
+    /** Stable admission identity. Must not create or update a playback object. */
+    virtual const UObject* GetPlaybackIdentity() const = 0;
     virtual bool CollectAudioRoomPaths(TArray<FSoftObjectPath>& OutPaths) const = 0;
+    /** Prepare media without allocating an emitter or posting. False keeps a valid incumbent. */
+    virtual bool PrepareForAdmission(bool bInNight) { return true; }
     virtual void UpdatePlayback(bool bInAdmitted, FName InReason, bool bInNight) = 0;
     virtual void ShutdownPlayback() = 0;
 };

@@ -10,6 +10,7 @@
 
 class UAkComponent;
 class UAkGameObject;
+class UAkRoomComponent;
 class AAkSpatialAudioVolume;
 struct FStreamableHandle;
 
@@ -115,16 +116,20 @@ class WANDERER_API UWandererAudioSourceComponent : public UActorComponent,
     virtual const FWandererWorldAudioProfileRow* GetProfile() const;
     AAkSpatialAudioVolume* ResolveRoom() const;
     virtual bool Evaluate(const FVector& InListener) override;
+    virtual bool PrepareForAdmission(bool bInNight) override;
     virtual void UpdatePlayback(bool bInAdmitted, FName InReason, bool bInNight) override;
     virtual void ShutdownPlayback() override;
 
     virtual FAudioSchedulingInfo GetSchedulingInfo() const override;
     virtual FName GetAudioResourceGroup() const override;
-    virtual UObject* GetPlaybackIdentity() override;
+    virtual const UObject* GetPlaybackIdentity() const override;
     virtual bool CollectAudioRoomPaths(TArray<FSoftObjectPath>& OutPaths) const override;
 
   protected:
-    virtual UAkGameObject* GetPlaybackObject();
+    virtual UAkGameObject* GetPlaybackObject() const;
+    virtual UAkGameObject* AcquirePlaybackObject();
+    UAkComponent* GetOwnedEmitter() const { return OwnedEmitter; }
+    UAkComponent* AcquireWorldEmitter(bool bInPreferPrevious);
     void SetEvaluationState(float InPriority, bool bInProtected, const FString& InStatus);
     virtual void PreparePlaybackObject(UAkGameObject* Object)
     {
@@ -139,7 +144,8 @@ class WANDERER_API UWandererAudioSourceComponent : public UActorComponent,
     bool EvaluateGeometry(const FVector& Listener,
                           const FWandererWorldAudioProfileRow& Row,
                           bool& bInsideRoom);
-    void CreateOwnedEmitter();
+    UAkRoomComponent* ResolvePlaybackRoom() const;
+    void UpdateOwnedEmitter();
     void UpdateEmitterGeometry(const FWandererWorldAudioProfileRow& Row);
     void UpdateSplineBlend(const FWandererWorldAudioProfileRow& Row);
     void ReleaseEvent();
@@ -162,8 +168,10 @@ class WANDERER_API UWandererAudioSourceComponent : public UActorComponent,
     TWeakObjectPtr<UAkGameObject> PostedObjectWeakPtr;
     double LoadStartedAtSec = 0;
     uint32 PlayingID = 0;
-    bool bStopping = false;
+    bool bPreferPreviousEmitter = false;
     bool bOwnsResourceLease = false;
+    FName PostedResourceGroup;
+    float PostedTailSec = 0;
     bool bProtected = false;
     float DistanceM = 0;
     float EffectivePriority = 0;

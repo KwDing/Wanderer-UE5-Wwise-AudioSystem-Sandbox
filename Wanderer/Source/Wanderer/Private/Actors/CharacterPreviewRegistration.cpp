@@ -67,5 +67,5 @@ namespace
             }
         }
     };
-    FCharacterPreviewRegistration Registration;
+    FCharacterPreviewRegistration CharacterPreviewRegistration;
 } // namespace

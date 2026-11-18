@@ -1,7 +1,5 @@
 #include "Systems/Audio/RadioChannelLayout.h"
 
-#include "AK/SoundEngine/Common/AkSpeakerConfig.h"
-
 FRadioChannelLayout::FRadioChannelLayout(
     const TArray<FRadioEmitterSnapshot>& Sources, FName ContentID, bool bInStereo)
     : bStereo(bInStereo)
@@ -24,15 +22,15 @@ FRadioChannelLayout::FRadioChannelLayout(
     }
 }
 
-int32 FRadioChannelLayout::GetChannelMask(int32 InSlot) const
+ERadioChannel FRadioChannelLayout::GetChannel(int32 InSlot) const
 {
     if (!GetMember(InSlot))
     {
-        return 0;
+        return ERadioChannel::None;
     }
     if (!bStereo)
     {
-        return AK_SPEAKER_FRONT_CENTER;
+        return ERadioChannel::Center;
     }
 
     // Pair by device number within this content, including paused devices.
@@ -46,9 +44,9 @@ int32 FRadioChannelLayout::GetChannelMask(int32 InSlot) const
     }
     if (MemberCount == 1 || (MemberCount == 3 && Rank == 2))
     {
-        return AK_SPEAKER_SETUP_STEREO;
+        return ERadioChannel::Stereo;
     }
-    return Rank % 2 == 0 ? AK_SPEAKER_FRONT_LEFT : AK_SPEAKER_FRONT_RIGHT;
+    return Rank % 2 == 0 ? ERadioChannel::Left : ERadioChannel::Right;
 }
 
 float FRadioChannelLayout::GetGain() const

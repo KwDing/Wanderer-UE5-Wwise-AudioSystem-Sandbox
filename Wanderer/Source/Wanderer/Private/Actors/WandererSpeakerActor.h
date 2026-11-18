@@ -11,6 +11,7 @@ class UBoxComponent;
 class UStaticMeshComponent;
 class USceneComponent;
 class UStaticMesh;
+class UWandererObjectAudioComponent;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
     FWandererSpeakerPlaybackRequested, FName, OptionID, bool, bRequested);
@@ -74,6 +75,9 @@ public:
         ItemType = InItem;
     }
     void SetPreview(bool bInPreview);
+    bool ConfirmAudioPlacement(const FGuid& InInstanceID);
+    void WithdrawAudioEmitter();
+    const FObjectAudioEmitterHandle& GetEmitterHandle() const;
 
 protected:
     virtual void EndPlay(const EEndPlayReason::Type InEndPlayReason) override;
@@ -88,6 +92,9 @@ private:
     UPROPERTY(VisibleAnywhere)
     TObjectPtr<UStaticMeshComponent> Visual;
 
+    UPROPERTY(VisibleAnywhere)
+    TObjectPtr<UWandererObjectAudioComponent> ObjectAudio;
+
     UPROPERTY(Transient)
     int32 DeviceNumber = 0;
 
@@ -101,6 +108,7 @@ private:
     bool bPlaybackRequested = false;
 
     FGuid DeviceID = FGuid::NewGuid();
+    bool bPreview = false;
     bool bEndingPlay = false;
     bool bPublishingPlayback = false;
 

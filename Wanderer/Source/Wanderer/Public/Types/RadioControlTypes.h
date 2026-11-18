@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 
+#include "Types/Audio/AudioEmitterTypes.h"
 #include "RadioControlTypes.generated.h"
 
 UENUM(BlueprintType)
@@ -10,6 +11,31 @@ enum class EWandererSpeakerItem : uint8
     Automatic,
     Radio,
     Mounted
+};
+
+enum class ERadioPlaybackPhase : uint8
+{
+    Stopped,
+    LoadingMedia,
+    WaitingForEmitters,
+    WaitingForListener,
+    Ready
+};
+
+enum class ERadioContent : uint8
+{
+    Song,
+    Noise,
+    Hiss
+};
+
+enum class ERadioChannel : uint8
+{
+    None,
+    Stereo,
+    Left,
+    Right,
+    Center
 };
 
 USTRUCT(BlueprintType)
@@ -117,4 +143,5 @@ struct FRadioEmitterSnapshot
     FName ContentID;
     int32 Number = 0;
     bool bPlaying = false;
+    FObjectAudioEmitterHandle EmitterHandle;
 };

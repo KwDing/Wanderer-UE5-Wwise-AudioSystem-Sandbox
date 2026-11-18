@@ -5,6 +5,7 @@
 #include "Types/Audio/AudioSchedulingTypes.h"
 
 class UAkAudioEvent;
+class URadioPlaybackManager;
 struct FStreamableHandle;
 
 /** Private state owned by the world subsystem; never a public resource configuration. */
@@ -33,6 +34,13 @@ struct FAudioSourceCandidate
 {
     TWeakObjectPtr<UObject> SourceWeakPtr;
     FAudioSchedulingInfo Info;
+    FGuid ObjectInstanceID;
+    TWeakObjectPtr<URadioPlaybackManager> RadioWeakPtr;
+    FName ContentID;
+    bool bEmergency = false;
+    bool bAdmitted = false;
+    bool bPreparing = false;
+    FName RejectionReason;
 };
 
 struct FAudioResourceStateMap

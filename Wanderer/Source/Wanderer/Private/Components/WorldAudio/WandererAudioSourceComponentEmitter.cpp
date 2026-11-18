@@ -1,10 +1,15 @@
 #include "Components/WorldAudio/WandererAudioSourceComponent.h"
 
+#include "Engine/World.h"
+
 #include "AkComponent.h"
 #include "AkRoomComponent.h"
 #include "AkSpatialAudioVolume.h"
 
-UAkGameObject* UWandererAudioSourceComponent::GetPlaybackObject()
+#include "Interfaces/Audio/AudioPlaybackService.h"
+#include "Systems/Audio/WandererAudioSubsystem.h"
+
+UAkGameObject* UWandererAudioSourceComponent::GetPlaybackObject() const
 {
     const auto* Row = GetProfile();
     if (!Row)
@@ -13,29 +18,61 @@ UAkGameObject* UWandererAudioSourceComponent::GetPlaybackObject()
     }
     if (Row->Mode == EWandererWorldAudioMode::Room)
     {
-        auto* Room = ResolveRoom();
-        return Room && Room->Room && Room->Room->bEnable ? Room->Room.Get() : nullptr;
+        return ResolvePlaybackRoom();
     }
-    CreateOwnedEmitter();
-    UpdateEmitterGeometry(*Row);
-    UpdateSplineBlend(*Row);
-    UpdateAreaPresence(Row->Mode == EWandererWorldAudioMode::Area);
     return OwnedEmitter;
 }
 
-void UWandererAudioSourceComponent::CreateOwnedEmitter()
+UAkGameObject* UWandererAudioSourceComponent::AcquirePlaybackObject()
 {
-    if (!OwnedEmitter && HasBegunPlay() && IsValid(GetOwner()))
+    const FWandererWorldAudioProfileRow* Row = GetProfile();
+    if (Row && Row->Mode != EWandererWorldAudioMode::Room)
     {
-        // Dedicated component: never borrow or stop an unrelated object's sound.
-        OwnedEmitter = NewObject<UAkComponent>(GetOwner(), NAME_None, RF_Transient);
+        if (UAkComponent* Emitter = AcquireWorldEmitter(false))
+        {
+            Emitter->bUseReverbVolumes = true;
+            if (USceneComponent* Root = GetOwner()->GetRootComponent())
+            {
+                Emitter->AttachToComponent(Root, FAttachmentTransformRules::SnapToTargetNotIncludingScale);
+            }
+            else
+            {
+                Emitter->SetWorldTransform(GetOwner()->GetActorTransform());
+            }
+        }
+        UpdateOwnedEmitter();
+    }
+    return GetPlaybackObject();
+}
+
+UAkRoomComponent* UWandererAudioSourceComponent::ResolvePlaybackRoom() const
+{
+    const AAkSpatialAudioVolume* Room = ResolveRoom();
+    return Room && IsValid(Room->Room) && Room->Room->bEnable ? Room->Room.Get() : nullptr;
+}
+
+UAkComponent* UWandererAudioSourceComponent::AcquireWorldEmitter(bool bInPreferPrevious)
+{
+    UWandererAudioSubsystem* System = GetWorld()->GetSubsystem<UWandererAudioSubsystem>();
+    if (!OwnedEmitter && HasBegunPlay() && IsValid(GetOwner()) && System)
+    {
+        OwnedEmitter = System->AcquireEmitter(*this, bInPreferPrevious);
+        bPreferPreviousEmitter = bInPreferPrevious;
         AppliedAreaRadius = -1;
         AppliedInsideBlend = -1;
         AppliedAreaPresence = -1;
-        OwnedEmitter->SetupAttachment(GetOwner()->GetRootComponent());
-        OwnedEmitter->OcclusionRefreshInterval = 0;
-        OwnedEmitter->StopWhenOwnerDestroyed = true;
-        OwnedEmitter->RegisterComponent();
+    }
+    return OwnedEmitter;
+}
+
+void UWandererAudioSourceComponent::UpdateOwnedEmitter()
+{
+    const FWandererWorldAudioProfileRow* Row = GetProfile();
+    if (OwnedEmitter && Row)
+    {
+        UpdateEmitterGeometry(*Row);
+        UpdateSplineBlend(*Row);
+        UpdateAreaPresence(Row->Mode == EWandererWorldAudioMode::Area);
     }
 }
 
@@ -49,13 +86,13 @@ void UWandererAudioSourceComponent::UpdateEmitterGeometry(const FWandererWorldAu
         const float Radius = Row.AreaSpreadRadiusM * 100;
         if (!FMath::IsNearlyEqual(AppliedAreaRadius, Radius))
         {
-            OwnedEmitter->SetGameObjectRadius(Radius, FMath::Max(.001f, Radius * .05f));
+            WandererAudioPlayback::SetEmitterRadius(*OwnedEmitter, Radius, FMath::Max(.001f, Radius * .05f));
             AppliedAreaRadius = Radius;
         }
     }
     else if (OwnedEmitter && AppliedAreaRadius >= 0)
     {
-        OwnedEmitter->SetGameObjectRadius(0, 0);
+        WandererAudioPlayback::SetEmitterRadius(*OwnedEmitter, 0, 0);
         OwnedEmitter->SetRelativeLocation(FVector::ZeroVector);
         AppliedAreaRadius = -1;
     }
@@ -67,16 +104,14 @@ void UWandererAudioSourceComponent::UpdateSplineBlend(const FWandererWorldAudioP
     {
         if (!FMath::IsNearlyEqual(AppliedInsideBlend, InsideBlend, .001f))
         {
-            OwnedEmitter->SetRTPCValue(nullptr,
-                InsideBlend,
-                AppliedInsideBlend < 0 ? 0 : FMath::RoundToInt(Row.SplineBlendSeconds * 1000),
-                TEXT("AmbientSpline_Inside"));
+            WandererAudioPlayback::SetWorldEmitterParameter(*OwnedEmitter, EWorldAudioEmitterParameter::SplineInside,
+                InsideBlend, AppliedInsideBlend < 0 ? 0 : FMath::RoundToInt(Row.SplineBlendSeconds * 1000));
             AppliedInsideBlend = InsideBlend;
         }
     }
     else if (OwnedEmitter && AppliedInsideBlend >= 0)
     {
-        OwnedEmitter->SetRTPCValue(nullptr, 0, 0, TEXT("AmbientSpline_Inside"));
+        WandererAudioPlayback::SetWorldEmitterParameter(*OwnedEmitter, EWorldAudioEmitterParameter::SplineInside, 0, 0);
         AppliedInsideBlend = -1;
     }
 }

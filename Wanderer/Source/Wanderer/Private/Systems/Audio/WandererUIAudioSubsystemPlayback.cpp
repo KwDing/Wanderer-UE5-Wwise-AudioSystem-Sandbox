@@ -3,12 +3,14 @@
 #include "Engine/World.h"
 #include "UObject/StrongObjectPtr.h"
 
-#include "AkAudioDevice.h"
 #include "AkAudioEvent.h"
 
 #include "Core/Diagnostics/DiagnosticRecorder.h"
 #include "Core/Diagnostics/DiagnosticTraceScope.h"
 #include "Data/Audio/WandererUIAudioProfile.h"
+#include "Interfaces/Audio/AudioPlaybackService.h"
+#include "Systems/Audio/AudioEventLeaseManager.h"
+#include "Systems/Audio/WwiseAudioBackend.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogWandererUIAudio, Log, All);
 
@@ -92,6 +94,24 @@ namespace
     }
 } // namespace
 
+void UWandererUIAudioSubsystem::PreloadProfileEvents(const UWandererUIAudioProfile& InProfile)
+{
+    const FName Actions[] = {TEXT("Open"), TEXT("Choose"), TEXT("Cancel"), TEXT("Close")};
+    for (FName Name : Actions)
+    {
+        FWandererUIAudioActionRow Row;
+        FString Error;
+        if (InProfile.FindAction(Name, Row, Error) && Row.bEnabled)
+        {
+            const auto* Definitions = GetAudioActions(Row);
+            if (Definitions && ValidateUIActions(*Definitions))
+            {
+                RequestEvent((*Definitions)[0].Event);
+            }
+        }
+    }
+}
+
 int32 UWandererUIAudioSubsystem::PlayAction(
     UWorld* InWorld, const UClass* InScreenClass, EWandererUIAudioAction InAction)
 {
@@ -132,6 +152,11 @@ int32 UWandererUIAudioSubsystem::PlayAction(
             TEXT("Profile missing/invalid or action disabled; see UI domain log."));
         return 0;
     }
+    RequestEvent(Event.Get());
+    if (!UAudioEventLeaseManager::IsReady(Event.Get()))
+    {
+        return 0;
+    }
     const int32 PlayingID = PostFiniteEvent(WorldWeakPtr.Get(), Event.Get());
     WANDERER_DIAGNOSTIC(WorldWeakPtr.Get(),
         EDiagnosticDomain::Audio,
@@ -153,21 +178,12 @@ int32 UWandererUIAudioSubsystem::PlayAction(
 
 int32 UWandererUIAudioSubsystem::PostFiniteEvent(UWorld* InWorld, UAkAudioEvent* InEvent)
 {
-    if (!CanPlay(InWorld) || !IsValid(InEvent) || !FAkAudioDevice::IsInitialized())
+    if (!CanPlay(InWorld) || !IsValid(InEvent) || !WandererAudioPlayback::IsReady(*InWorld))
     {
         return 0;
     }
-    // Assets may first load before PIE while the editor resource loader is disabled.
-    const TWeakObjectPtr<UWorld> WorldWeakPtr(InWorld);
-    if (!InEvent->IsLoaded())
-    {
-        InEvent->LoadData();
-    }
-    if (!CanPlay(WorldWeakPtr.Get()) || !IsValid(InEvent))
-    {
-        return 0;
-    }
-    if (!InEvent->IsLoaded() || !InEvent->GetShortID() || InEvent->IsInfinite)
+    if (!WandererAudioBackend::IsFiniteEvent(*InEvent) || !EventLeases
+        || !UAudioEventLeaseManager::IsReady(InEvent) || !EventLeases->Acquire(InEvent))
     {
         UE_LOG(LogWandererUIAudio,
             Error,
@@ -175,8 +191,8 @@ int32 UWandererUIAudioSubsystem::PostFiniteEvent(UWorld* InWorld, UAkAudioEvent*
             *GetNameSafe(InEvent));
         return 0;
     }
-    const int32 PlayingID = static_cast<int32>(
-        InEvent->PostAmbient(nullptr, nullptr, nullptr, static_cast<AkCallbackType>(0), nullptr));
+    const int32 PlayingID = static_cast<int32>(UAudioEventLeaseManager::Post(*InEvent));
+    EventLeases->Retire(InEvent, PlayingID, -1, 0);
     if (!PlayingID)
     {
         UE_LOG(LogWandererUIAudio,

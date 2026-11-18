@@ -53,21 +53,21 @@ void FWandererAudioDiagnostics::Publish(const UObject* Context,
 
 const TCHAR* FWandererAudioDiagnostics::GetChannelName(EWandererAudioLogChannel InChannel)
 {
+#define WANDERER_AUDIO_CHANNEL_NAME_CASE(Name) \
+    case EWandererAudioLogChannel::Name:       \
+        return TEXT(#Name);
+
     switch (InChannel)
     {
-    case EWandererAudioLogChannel::Configuration:
-        return TEXT("Configuration");
-    case EWandererAudioLogChannel::Footsteps:
-        return TEXT("Footsteps");
-    case EWandererAudioLogChannel::Actions:
-        return TEXT("Actions");
-    case EWandererAudioLogChannel::Switches:
-        return TEXT("Switches");
-    case EWandererAudioLogChannel::Playback:
-        return TEXT("Playback");
-    case EWandererAudioLogChannel::Amb:
-        return TEXT("Amb");
+    WANDERER_AUDIO_CHANNEL_NAME_CASE(Configuration)
+    WANDERER_AUDIO_CHANNEL_NAME_CASE(Footsteps)
+    WANDERER_AUDIO_CHANNEL_NAME_CASE(Actions)
+    WANDERER_AUDIO_CHANNEL_NAME_CASE(Switches)
+    WANDERER_AUDIO_CHANNEL_NAME_CASE(Playback)
+    WANDERER_AUDIO_CHANNEL_NAME_CASE(Amb)
     default:
         return TEXT("Unknown");
     }
+
+#undef WANDERER_AUDIO_CHANNEL_NAME_CASE
 }

@@ -5,7 +5,7 @@
 #include "EngineUtils.h"
 #include "GameFramework/PlayerController.h"
 
-#include "AkAudioDevice.h"
+#include "AkComponent.h"
 #include "AkRoomComponent.h"
 
 #include "Core/Diagnostics/DiagnosticRecorder.h"
@@ -13,7 +13,12 @@
 #include "Interfaces/Audio/AudioBudgetProvider.h"
 #include "Interfaces/Audio/AudioSourceInterface.h"
 #include "Interfaces/EnvironmentStateInterface.h"
+#include "Systems/Audio/AudioEmitterPool.h"
+#include "Systems/Audio/AudioEventLeaseManager.h"
+#include "Systems/Audio/AudioPooledEmitterComponent.h"
 #include "Systems/Audio/AudioSchedulingStateTypes.h"
+#include "Systems/Audio/RadioPlaybackManager.h"
+#include "Systems/Audio/WwiseAudioBackend.h"
 
 UWandererAudioSubsystem::UWandererAudioSubsystem()
     : ResourceState(MakeShared<FAudioResourceStateMap>())
@@ -22,16 +27,31 @@ UWandererAudioSubsystem::UWandererAudioSubsystem()
 
 FString UWandererAudioSubsystem::GetSummary() const
 {
-    return FString::Printf(TEXT("Registered=%d  Admitted=%d  Protected overflow=%d  | ")
+    const FAudioEmitterPoolStats Stats = GetEmitterPoolStats();
+    return FString::Printf(TEXT("Registered=%d Admitted=%d | Pool=%d Active=%d Retiring=%d ")
+                               TEXT("Emergency=%d | ")
                                TEXT("Posted != physical voices; use Wwise Profiler"),
                            SourcesWeakPtrs.Num(),
-                           AdmittedCount,
-                           ProtectedOverflow);
+                           AdmittedCount, Stats.Capacity, Stats.WorldActive, Stats.WorldRetiring,
+                           Stats.EmergencyActive);
+}
+
+FAudioEmitterPoolStats UWandererAudioSubsystem::GetEmitterPoolStats() const
+{
+    return EmitterPool ? EmitterPool->GetStats() : FAudioEmitterPoolStats();
 }
 
 void UWandererAudioSubsystem::OnWorldBeginPlay(UWorld& InWorld)
 {
     Super::OnWorldBeginPlay(InWorld);
+    ResolveBudget();
+    if (!EmitterPool)
+    {
+        EmitterPool = NewObject<UAudioEmitterPool>(this);
+    }
+    const FAudioBudgetLimits Limits = ReadBudgetLimits();
+    EmitterPool->ConfigureBudget(Limits);
+    EmitterPool->Warmup(InWorld, FMath::Max(1, Limits.TotalEvents));
     UGameInstance* Instance = InWorld.GetGameInstance();
     UWandererEventBusSubsystem* Bus =
         Instance ? Instance->GetSubsystem<UWandererEventBusSubsystem>() : nullptr;
@@ -56,23 +76,43 @@ void UWandererAudioSubsystem::Tick(float DeltaTime)
     }
 
     PruneRadioSessions();
+    if (EmitterPool)
+    {
+        EmitterPool->RecycleReadyEmitters([this](UAkAudioEvent* Event)
+        {
+            ReleaseEventResource(Event);
+        });
+    }
+    if (bDeinitializing)
+    {
+        return;
+    }
     UpdateElapsedSec += DeltaTime;
     const FAudioBudgetLimits Limits = ReadBudgetLimits();
+    if (EmitterPool)
+    {
+        EmitterPool->ConfigureBudget(Limits);
+        EmitterPool->Warmup(*World, 0);
+    }
     const float Interval = FMath::Clamp(Limits.UpdateIntervalSec,
                                         AudioSchedulingDefaults::UpdateIntervalMinSec,
                                         AudioSchedulingDefaults::UpdateIntervalMaxSec);
-    if (UpdateElapsedSec < Interval)
+    if (UpdateElapsedSec < Interval && !bAdmissionDirty)
     {
+        UpdateObjectEmitters(false);
         return;
     }
 
     UpdateElapsedSec = 0.0f;
+    bAdmissionDirty = false;
     ResolveBudget();
     SourcesWeakPtrs.RemoveAll([](const TWeakObjectPtr<UObject>& Item) { return !Item.IsValid(); });
     APlayerController* Player = World->GetFirstPlayerController();
     if (!Player || !Player->GetPawn())
     {
+        ResetBuildingListener();
         SuspendSources();
+        UpdateObjectEmitters(false);
         return;
     }
 
@@ -89,6 +129,10 @@ void UWandererAudioSubsystem::Tick(float DeltaTime)
     if (!bDeinitializing)
     {
         Schedule(Listener);
+        if (!bDeinitializing)
+        {
+            UpdateObjectEmitters(true);
+        }
     }
 }
 
@@ -102,6 +146,7 @@ bool UWandererAudioSubsystem::DoesSupportWorldType(EWorldType::Type Type) const
     return Type == EWorldType::Game || Type == EWorldType::PIE;
 }
 
+// 先封闭调度入口，避免停声时重入
 void UWandererAudioSubsystem::Deinitialize()
 {
     if (bDeinitializing)
@@ -111,9 +156,10 @@ void UWandererAudioSubsystem::Deinitialize()
 
     bDeinitializing = true;
     ShutdownRadioSessions();
+    ShutdownObjectEmitters();
     const TArray<TWeakObjectPtr<UObject>> SourcesToStop = MoveTemp(SourcesWeakPtrs);
     RoomBuildingsWeakPtrs.Reset();
-    ListenerBuildingWeakPtr.Reset();
+    ResetBuildingListener();
     for (const TWeakObjectPtr<UObject>& SourceWeakPtr : SourcesToStop)
     {
         IAudioSourceInterface* Source = Cast<IAudioSourceInterface>(SourceWeakPtr.Get());
@@ -123,11 +169,24 @@ void UWandererAudioSubsystem::Deinitialize()
         }
     }
 
+    if (EmitterPool)
+    {
+        EmitterPool->Shutdown([this](UAkAudioEvent* Event, uint32 PlayingID,
+            double TailDeadlineSec, float TailSec)
+        {
+            if (EventLeaseManager)
+            {
+                EventLeaseManager->Retire(Event, PlayingID, TailDeadlineSec, TailSec);
+            }
+        });
+        EmitterPool = nullptr;
+    }
     ShutdownResources();
     BudgetWeakPtr.Reset();
     Super::Deinitialize();
 }
 
+// 只接收本世界声源，避免跨实例调度
 void UWandererAudioSubsystem::RegisterSource(UObject* InSource)
 {
     check(IsInGameThread());
@@ -159,13 +218,43 @@ void UWandererAudioSubsystem::UnregisterSource(UObject* InSource)
 
     if (ListenerBuildingWeakPtr.Get() == InSource)
     {
-        ListenerBuildingWeakPtr.Reset();
+        ResetBuildingListener();
     }
 }
 
 bool UWandererAudioSubsystem::IsListenerInsideBuilding(const UObject* InSource) const
 {
     return InSource && ListenerBuildingWeakPtr.Get() == InSource;
+}
+
+UAkComponent* UWandererAudioSubsystem::AcquireEmitter(
+    const UObject& InSource, bool bInPreferPrevious)
+{
+    return EmitterPool && IsSourceCurrent(&InSource)
+        ? EmitterPool->Acquire(InSource, bInPreferPrevious)
+        : nullptr;
+}
+
+void UWandererAudioSubsystem::ApplyEmitterReverb(UAkComponent& InEmitter, bool bInUseVolumes)
+{
+    if (UAudioPooledEmitterComponent* Emitter = Cast<UAudioPooledEmitterComponent>(&InEmitter))
+    {
+        Emitter->ApplyEmitterReverb(bInUseVolumes);
+    }
+}
+
+void UWandererAudioSubsystem::ReleaseEmitter(const UObject& InSource, UAkComponent* InComponent,
+    UAkAudioEvent* InEvent, uint32 InPlayingID, int32 InFadeMs, float InTailSec,
+    FName InGroup, bool bInOwnsMedia, bool bInPreferPrevious)
+{
+    check(EmitterPool);
+    EmitterPool->BeginRelease(InSource, InComponent, InEvent, InPlayingID, InFadeMs,
+        InTailSec, InGroup, bInOwnsMedia, bInPreferPrevious);
+}
+
+bool UWandererAudioSubsystem::HasPendingEmitterRelease(const UObject& InSource) const
+{
+    return EmitterPool && EmitterPool->HasPendingSource(InSource);
 }
 
 void UWandererAudioSubsystem::ConfigureResourceGroups(
@@ -210,26 +299,53 @@ bool UWandererAudioSubsystem::RegisterRoomMembership(UObject& InSource)
 
 void UWandererAudioSubsystem::UpdateBuildingListener(const FVector& InListener)
 {
+    UAkRoomComponent* Room = nullptr;
+    const UWorld* World = GetWorld();
+    if (RoomBuildingsWeakPtrs.IsEmpty()
+        || !WandererAudioBackend::TryQueryPriorityRoom(World, InListener, Room))
+    {
+        ResetBuildingListener();
+        return;
+    }
+
+    UAkRoomComponent* PreviousRoom = ListenerRoomWeakPtr.Get();
+    if (ListenerRoomWeakPtr.IsStale()
+        || (PreviousRoom
+            && (!PreviousRoom->IsRegistered() || !PreviousRoom->bEnable || PreviousRoom->AutoPost)))
+    {
+        ResetBuildingListener();
+    }
+
+    if (!IsValid(Room) || Room->GetWorld() != World || !Room->IsRegistered() || !Room->bEnable || Room->AutoPost)
+    {
+        Room = nullptr;
+    }
+    const TWeakObjectPtr<UAkRoomComponent> Sample(Room);
+    const bool bConfirmed = ListenerRoomWeakPtr.HasSameIndexAndSerialNumber(Sample)
+        || (bHasPendingListenerRoom && PendingListenerRoomWeakPtr.HasSameIndexAndSerialNumber(Sample));
+    if (!bConfirmed)
+    {
+        PendingListenerRoomWeakPtr = Sample;
+        bHasPendingListenerRoom = true;
+        return;
+    }
+    ListenerRoomWeakPtr = Sample;
+    PendingListenerRoomWeakPtr.Reset();
+    bHasPendingListenerRoom = false;
     ListenerBuildingWeakPtr.Reset();
-    FAkAudioDevice* Device = FAkAudioDevice::Get();
-    if (RoomBuildingsWeakPtrs.IsEmpty() || !Device)
+    if (Room)
     {
-        return;
+        ListenerBuildingWeakPtr =
+            RoomBuildingsWeakPtrs.FindRef(FSoftObjectPath(Room->GetOwner()));
     }
+}
 
-    const TArray<UAkRoomComponent*> Rooms =
-        Device->FindRoomComponentsAtLocation(InListener, GetWorld());
-    if (Rooms.IsEmpty() || !Rooms[0] || Rooms[0]->AutoPost)
-    {
-        return;
-    }
-
-    const TWeakObjectPtr<UObject>* Building =
-        RoomBuildingsWeakPtrs.Find(FSoftObjectPath(Rooms[0]->GetOwner()));
-    if (Building)
-    {
-        ListenerBuildingWeakPtr = *Building;
-    }
+void UWandererAudioSubsystem::ResetBuildingListener()
+{
+    ListenerBuildingWeakPtr.Reset();
+    ListenerRoomWeakPtr.Reset();
+    PendingListenerRoomWeakPtr.Reset();
+    bHasPendingListenerRoom = false;
 }
 
 void UWandererAudioSubsystem::ResolveBudget()
@@ -274,6 +390,13 @@ bool UWandererAudioSubsystem::ReadNightState() const
 
 void UWandererAudioSubsystem::SuspendSources()
 {
+    SuspendRadioAdmissions();
+    TArray<FGuid> ObjectIDs;
+    ObjectEmitters.GetKeys(ObjectIDs);
+    for (const FGuid& ID : ObjectIDs)
+    {
+        SetObjectAdmission(ID, false, false);
+    }
     const TArray<TWeakObjectPtr<UObject>> Snapshot = SourcesWeakPtrs;
     for (const TWeakObjectPtr<UObject>& SourceWeakPtr : Snapshot)
     {

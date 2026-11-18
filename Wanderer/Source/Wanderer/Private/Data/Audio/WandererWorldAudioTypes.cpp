@@ -26,9 +26,13 @@ FString FWandererWorldAudioProfileRow::Validate() const
         return TEXT("优先级/距离惩罚须为0～100，近处保护距离须非负");
     }
     if (MaxInstances < 1 || !FMath::IsFinite(FadeOutSec) || FadeOutSec < 0
-        || FadeOutSec > 2)
+        || FadeOutSec > 2 || !FMath::IsFinite(FadeInSec) || FadeInSec < 0 || FadeInSec > 2)
     {
         return TEXT("实例上限至少1，淡出时间须为0～2秒");
+    }
+    if (!FMath::IsFinite(ReverbTailHoldSec) || ReverbTailHoldSec < 0)
+    {
+        return TEXT("Reverb tail hold must be finite and nonnegative");
     }
     return FString();
 }

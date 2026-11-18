@@ -1,5 +1,6 @@
 #include "Components/WorldAudio/WandererBuildingAmbienceComponent.h"
 #include "Core/ActorPathUtils.h"
+#include "Interfaces/Audio/AudioPlaybackService.h"
 #include "Systems/Audio/WandererAudioSubsystem.h"
 #include "AkComponent.h"
 #include "AkRoomComponent.h"
@@ -14,6 +15,8 @@ const FWandererWorldAudioProfileRow* UWandererBuildingAmbienceComponent::GetProf
     PlaybackProfile.NightPlayEvent = BuildingNightEvent;
     PlaybackProfile.Priority = BuildingPriority;
     PlaybackProfile.FadeOutSec = BuildingFadeOutSeconds;
+    PlaybackProfile.FadeInSec = 0; // BuildingGain already provides the authored fade-in.
+    PlaybackProfile.ReverbTailHoldSec = ReverbTailHoldSec;
     return &PlaybackProfile;
 }
 
@@ -56,7 +59,8 @@ bool UWandererBuildingAmbienceComponent::Evaluate(const FVector& Listener)
         GetWorld()->GetSubsystem<UWandererAudioSubsystem>();
     const bool bGroupReady = System && System->IsResourceGroupActive(ResourceGroup);
     const bool bInside = System && System->IsListenerInsideBuilding(this);
-    const bool bReady = bBuildingEnabled && Error.IsEmpty() && bGroupReady && bInside;
+    const bool bAvailable = bBuildingEnabled && Error.IsEmpty() && bGroupReady;
+    const bool bReady = bAvailable && bInside;
     FString State = bReady ? TEXT("Inside building") : TEXT("Outside building / disabled");
     if (!bGroupReady)
     {
@@ -68,30 +72,31 @@ bool UWandererBuildingAmbienceComponent::Evaluate(const FVector& Listener)
         State = Error;
     }
     SetEvaluationState(BuildingPriority, false, State);
-    if (!bReady && GetPlayingID() == 0 && BuildingEmitter)
+    if (UAkComponent* Emitter = GetOwnedEmitter())
     {
-        BuildingEmitter->DestroyComponent();
-        BuildingEmitter = nullptr;
-    }
-    if (BuildingEmitter)
-    {
-        BuildingEmitter->SetWorldLocation(ListenerPosition);
+        Emitter->SetWorldLocation(ListenerPosition);
     }
     return bReady;
 }
 
-UAkGameObject* UWandererBuildingAmbienceComponent::GetPlaybackObject()
+const UObject* UWandererBuildingAmbienceComponent::GetPlaybackIdentity() const
 {
-    if (!BuildingEmitter && HasBegunPlay() && IsValid(GetOwner()))
+    return this;
+}
+
+UAkGameObject* UWandererBuildingAmbienceComponent::GetPlaybackObject() const
+{
+    return GetOwnedEmitter();
+}
+
+UAkGameObject* UWandererBuildingAmbienceComponent::AcquirePlaybackObject()
+{
+    if (UAkComponent* Emitter = AcquireWorldEmitter(true))
     {
-        BuildingEmitter = NewObject<UAkComponent>(GetOwner(), NAME_None, RF_Transient);
-        BuildingEmitter->bUseReverbVolumes = false;
-        BuildingEmitter->OcclusionRefreshInterval = 0;
-        BuildingEmitter->StopWhenOwnerDestroyed = true;
-        BuildingEmitter->SetWorldLocation(ListenerPosition);
-        BuildingEmitter->RegisterComponent();
+        Emitter->bUseReverbVolumes = false;
+        Emitter->SetWorldLocation(ListenerPosition);
     }
-    return BuildingEmitter;
+    return GetPlaybackObject();
 }
 
 bool UWandererBuildingAmbienceComponent::ContainsRoom(const AActor* Room) const
@@ -108,25 +113,15 @@ bool UWandererBuildingAmbienceComponent::ContainsRoom(const AActor* Room) const
         });
 }
 
-void UWandererBuildingAmbienceComponent::EndPlay(const EEndPlayReason::Type Reason)
-{
-    Super::EndPlay(Reason); // Stops owned Playing ID and returns leases before emitter destruction.
-    if (BuildingEmitter)
-    {
-        BuildingEmitter->DestroyComponent();
-    }
-    BuildingEmitter = nullptr;
-}
-
 void UWandererBuildingAmbienceComponent::PreparePlaybackObject(UAkGameObject* Object)
 {
     // Per-game-object RTPCs preserve ordinary Room instances of the same Event.
-    Object->SetRTPCValue(nullptr, 1, 0, TEXT("BuildingAmbience_Mode"));
-    Object->SetRTPCValue(nullptr, 0, 0, TEXT("BuildingAmbience_Gain"));
+    WandererAudioPlayback::SetWorldEmitterParameter(*Object, EWorldAudioEmitterParameter::BuildingMode, 1, 0);
+    WandererAudioPlayback::SetWorldEmitterParameter(*Object, EWorldAudioEmitterParameter::BuildingGain, 0, 0);
 }
 
 void UWandererBuildingAmbienceComponent::PlaybackStarted(UAkGameObject* Object)
 {
-    Object->SetRTPCValue(
-        nullptr, 1, FMath::RoundToInt(FadeInSeconds * 1000), TEXT("BuildingAmbience_Gain"));
+    WandererAudioPlayback::SetWorldEmitterParameter(*Object, EWorldAudioEmitterParameter::BuildingGain,
+        1, FMath::RoundToInt(FadeInSeconds * 1000));
 }

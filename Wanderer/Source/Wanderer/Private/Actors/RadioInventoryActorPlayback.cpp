@@ -28,15 +28,16 @@ TArray<FRadioEmitterSnapshot> ARadioInventoryActor::CollectEmitterSnapshots() co
     TArray<FRadioEmitterSnapshot> Result;
     for (const TWeakObjectPtr<AWandererSpeakerActor>& SourceWeakPtr : SourcesWeakPtrs)
     {
-        if (!SourceWeakPtr.IsValid())
+        const AWandererSpeakerActor* Source = SourceWeakPtr.Get();
+        if (!Source || !Source->GetEmitterHandle().IsSet())
         {
             continue;
         }
         FRadioEmitterSnapshot& Item = Result.AddDefaulted_GetRef();
-        Item.ContentID = SourceWeakPtr->GetOptionID();
-        Item.Number = SourceWeakPtr->GetDeviceNumber();
-        Item.bPlaying = SourceWeakPtr->IsPlaybackRequested();
-        Item.Transform = SourceWeakPtr->GetEmitterAnchor()->GetComponentTransform();
+        Item.ContentID = Source->GetOptionID();
+        Item.Number = Source->GetDeviceNumber();
+        Item.bPlaying = Source->IsPlaybackRequested();
+        Item.EmitterHandle = Source->GetEmitterHandle();
     }
     return Result;
 }
@@ -71,6 +72,21 @@ FName ARadioInventoryActor::GetRecorderTransportState() const
     }
     if (Source->IsPlaybackRequested())
     {
+        const UWandererAudioSubsystem* Audio = GetWorld()->GetSubsystem<UWandererAudioSubsystem>();
+        const auto Phase = Audio ? Audio->GetRadioPlaybackPhase(
+            const_cast<ARadioInventoryActor*>(this), Source->GetOptionID()) : ERadioPlaybackPhase::Stopped;
+        if (Phase == ERadioPlaybackPhase::LoadingMedia)
+        {
+            return TEXT("LoadingMedia");
+        }
+        if (Phase == ERadioPlaybackPhase::WaitingForEmitters)
+        {
+            return TEXT("WaitingForEmitters");
+        }
+        if (Phase == ERadioPlaybackPhase::WaitingForListener)
+        {
+            return TEXT("WaitingForListener");
+        }
         return TEXT("Playing");
     }
     return (GetWorld()->GetSubsystem<UWandererAudioSubsystem>()
@@ -128,7 +144,7 @@ void ARadioInventoryActor::LogRecorderAction(
     UE_LOG(LogWandererRecorder, Log, TEXT("[Audio/Amb][Speaker] %s"), *Text);
 }
 
-void ARadioInventoryActor::PausePairPlayback()
+bool ARadioInventoryActor::PausePairPlayback()
 {
     const TArray<TWeakObjectPtr<AWandererSpeakerActor>> Snapshot = SourcesWeakPtrs;
     for (const TWeakObjectPtr<AWandererSpeakerActor>& SourceWeakPtr : Snapshot)
@@ -138,7 +154,7 @@ void ARadioInventoryActor::PausePairPlayback()
             SetSourceIntent(*SourceWeakPtr, SourceWeakPtr->GetOptionID(), false);
         }
     }
-    UpdatePairPlayback(0);
+    return UpdatePairPlayback(0);
 }
 
 void ARadioInventoryActor::SetSourceIntent(
@@ -170,8 +186,10 @@ bool ARadioInventoryActor::StartPairPlayback()
     }
     SetSourceIntent(*Source, ContentID, true);
     const bool bUpdated = UpdatePairPlayback(0);
-    Status = bUpdated ? TEXT("Selected device playing; matching content stays in sync.")
-                      : TEXT("Device playback update failed.");
+    if (bUpdated)
+    {
+        Status = TEXT("Selected device playback requested; matching content stays in sync.");
+    }
     return bUpdated;
 }
 
@@ -199,19 +217,33 @@ bool ARadioInventoryActor::UpdatePairPlayback(float InDeltaTime)
         return false;
     }
     TArray<FName> Failed;
-    const bool bUpdated =
-        Audio->UpdateRadioPlayback(this, CollectEmitterSnapshots(), InDeltaTime, Failed);
+    const auto Submitted = CollectEmitterSnapshots();
+    const bool bUpdated = Audio->UpdateRadioPlayback(this, Submitted, InDeltaTime, Failed);
+    if (Failed.IsEmpty() || bShuttingDown)
+    {
+        return bUpdated;
+    }
+    bool bCurrentFailure = false;
     const TArray<TWeakObjectPtr<AWandererSpeakerActor>> Snapshot = SourcesWeakPtrs;
     for (const TWeakObjectPtr<AWandererSpeakerActor>& SourceWeakPtr : Snapshot)
     {
-        if (SourceWeakPtr.IsValid() && Failed.Contains(SourceWeakPtr->GetOptionID()))
+        auto* Source = SourceWeakPtr.Get();
+        if (!Source || !Failed.Contains(Source->GetOptionID()))
         {
-            SetSourceIntent(*SourceWeakPtr, SourceWeakPtr->GetOptionID(), false);
+            continue;
+        }
+        const auto& Handle = Source->GetEmitterHandle();
+        const FName ContentID = Source->GetOptionID();
+        if (Submitted.ContainsByPredicate([&Handle, ContentID](const FRadioEmitterSnapshot& Item)
+            { return Item.ContentID == ContentID && Item.EmitterHandle.Generation == Handle.Generation; }))
+        {
+            bCurrentFailure = true;
+            SetSourceIntent(*Source, ContentID, false);
         }
     }
-    if (!Failed.IsEmpty())
+    if (bCurrentFailure && !bShuttingDown)
     {
-        Status = TEXT("Content group ended or failed. Select its device and Play to restart.");
+        Status = TEXT("Radio audio failed to load or playback ended. Select Play to retry.");
         LogRecorderAction(TEXT("SystemStop"), TEXT("Failed"), TEXT("Playing"), Status);
     }
     return bUpdated;

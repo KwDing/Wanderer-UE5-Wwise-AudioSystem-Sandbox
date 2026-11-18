@@ -3,22 +3,22 @@
 
 namespace
 {
-    TSharedPtr<FBrowserMenuView> View;
+    TSharedPtr<FBrowserMenuView> WwiseBrowserMenuView;
 
     void StartBrowser()
     {
-        View = MakeShared<FBrowserMenuView>();
-        View->Start();
+        WwiseBrowserMenuView = MakeShared<FBrowserMenuView>();
+        WwiseBrowserMenuView->Start();
     }
 
     void StopBrowser()
     {
-        if (View)
+        if (WwiseBrowserMenuView)
         {
-            View->Stop();
-            View.Reset();
+            WwiseBrowserMenuView->Stop();
+            WwiseBrowserMenuView.Reset();
         }
     }
 
-    FEditorFeatureRegistration Registration(TEXT("WwiseBrowserExt"), &StartBrowser, &StopBrowser);
+    FEditorFeatureRegistration WwiseBrowserFeatureRegistration(TEXT("WwiseBrowserExt"), &StartBrowser, &StopBrowser);
 } // namespace

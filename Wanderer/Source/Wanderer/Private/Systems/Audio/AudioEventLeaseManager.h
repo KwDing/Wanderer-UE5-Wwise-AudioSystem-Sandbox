@@ -3,9 +3,12 @@
 #include "CoreMinimal.h"
 #include "UObject/Object.h"
 
+#include "Types/Audio/AudioSchedulingTypes.h"
+
 #include "AudioEventLeaseManager.generated.h"
 
 class UAkAudioEvent;
+class UAkGameObject;
 
 /**
  * Owns this world's manual Event leases; process accounting prevents one PIE world
@@ -19,11 +22,19 @@ class UAudioEventLeaseManager : public UObject
 
   public:
     bool Acquire(UAkAudioEvent* InEvent);
+    EAudioEventResourceStatus Advance(UAkAudioEvent* InEvent, float InPriority = 100.0f);
+    static FString GetLoadSummary();
+    static bool IsReady(UAkAudioEvent* InEvent);
+    static uint32 Post(UAkAudioEvent& InEvent, UAkGameObject* InObject = nullptr);
     void Release(UAkAudioEvent* InEvent);
+    void Retire(UAkAudioEvent* InEvent, uint32 InPlayingID, double InTailDeadlineSec, float InTailSec);
     void Stop();
     int32 GetEventCount() const;
 
   private:
+    friend struct FAudioPriorityTestAccess;
+    static uint64 GetRequestOrder(UAkAudioEvent* InEvent);
+
     UPROPERTY(Transient)
     TMap<TObjectPtr<UAkAudioEvent>, int32> EventUsers;
     bool bStopped = false;

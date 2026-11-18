@@ -14,6 +14,7 @@ class UItemPlacementComponent;
 class URadioControlModel;
 class UStaticMesh;
 class UTextureRenderTarget2D;
+struct FStreamableHandle;
 /** Local-player inventory. Owns device entities and delegates geometry/audio to lower layers. */
 UCLASS()
 class ARadioInventoryActor : public AActor, public IRadioControlInterface
@@ -51,6 +52,8 @@ private:
     TWeakObjectPtr<AWandererSpeakerActor> PreviewActorWeakPtr;
     TWeakObjectPtr<AWandererSpeakerActor> SelectedSourceWeakPtr;
     TArray<TWeakObjectPtr<AWandererSpeakerActor>> SourcesWeakPtrs;
+    TMap<EWandererSpeakerItem, TArray<FGuid>> ReturnedDeviceIDs;
+    TSharedPtr<FStreamableHandle> MeshRequest;
     FName PendingOption;
     FString Status;
     FVector LastPoint = FVector::ZeroVector;
@@ -63,6 +66,8 @@ private:
     bool bPreviewValid = false;
     bool bPublishingIntent = false;
     bool bShuttingDown = false;
+    bool bPreviewRequested = false;
+    bool bPlacementRequested = false;
 
     // Request validation and inventory ownership.
     bool ExecutePlacementRequest(const FRadioControlRequest& InRequest);
@@ -74,6 +79,7 @@ private:
     bool IsOwnedSource(const AWandererSpeakerActor* InSource) const;
     bool RetrieveAllSources();
     bool RetrieveSource(AWandererSpeakerActor* InSource);
+    void ReturnDeviceToInventory(AWandererSpeakerActor& InSource);
     void SetCursorOverPanel(bool bInOverPanel)
     {
         bCursorOverPanel = bInOverPanel;
@@ -88,6 +94,8 @@ private:
     bool ApplySurface(const FHitResult& InHit);
     bool BeginItemPlacement(EWandererSpeakerItem InItem);
     bool BeginPlacement();
+    bool PrepareSpeakerMeshes();
+    void UpdateSpeakerMeshes();
     void CancelPlacement();
     bool ConfirmPlacement();
     bool ConfirmPlacementFromPointer();
@@ -112,7 +120,7 @@ private:
     bool IsSourceNearby(const AWandererSpeakerActor* InSource) const;
     void LogRecorderAction(
         FName InAction, FName InResult, FName InPreviousState, const FString& InDetail);
-    void PausePairPlayback();
+    bool PausePairPlayback();
     bool SelectOption(FName InID);
     bool SelectSource(AWandererSpeakerActor* InSource);
     bool SelectSourceAlongRay(FVector InStart, FVector InDirection);

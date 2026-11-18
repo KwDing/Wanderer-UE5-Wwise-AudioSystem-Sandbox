@@ -10,6 +10,7 @@
 class UStaticMeshComponent;
 class USceneCaptureComponent2D;
 class UTextureRenderTarget2D;
+class UStaticMesh;
 
 /** Inventory-owned transient model studio; never a gameplay item or collision target. */
 UCLASS()
@@ -21,7 +22,7 @@ public:
     UTextureRenderTarget2D* GetPreviewTexture(EWandererSpeakerItem Item) const;
 
     AWandererSpeakerPreviewActor();
-    bool ShowItems();
+    bool ShowItems(UStaticMesh* InRadioMesh, UStaticMesh* InMountedMesh);
 
 private:
     UPROPERTY(VisibleAnywhere)

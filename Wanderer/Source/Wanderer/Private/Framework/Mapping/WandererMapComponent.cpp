@@ -4,38 +4,59 @@
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
-#include "EngineUtils.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
-#include "GameFramework/Volume.h"
 #include "HAL/PlatformTime.h"
-#include "Materials/MaterialInterface.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 
-#include "Core/NaturalSurfaceUtils.h"
 #include "Data/MapScanData.h"
-#include "Interfaces/CharacterSurfaceProvider.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogWandererMapScan, Log, All);
 
 UWandererMapComponent::UWandererMapComponent()
 {
     PrimaryComponentTick.bCanEverTick = true;
 }
 
+void UWandererMapComponent::BeginPlay()
+{
+    Super::BeginPlay();
+    FWorldDelegates::LevelAddedToWorld.AddUObject(this, &UWandererMapComponent::OnScanLevelChanged);
+    FWorldDelegates::LevelRemovedFromWorld.AddUObject(this, &UWandererMapComponent::OnScanLevelChanged);
+}
+
 void UWandererMapComponent::Rescan()
 {
     ScanCharacterWeakPtr.Reset();
     Snapshot.CellSize = CellSize;
+    Snapshot.Seed = FVector::ZeroVector;
     Snapshot.Cells.Reset();
     Snapshot.CellLookup.Reset();
     Snapshot.Entrances.Reset();
     Snapshot.MapBounds = FBox2D(ForceInit);
     NextCell = 0;
-    bNeedsScan = true;
+    Phase = EScanPhase::Waiting;
+    bLevelSetChanged = false;
+    NextLevel = 0;
+    NextActor = 0;
+    NextComponent = 0;
+    BoundsActorWeakPtr.Reset();
+    bCollectTrialBounds = false;
+    DoorCandidates.Reset();
+    NextDoor = 0;
+    EntranceBuckets.Reset();
+    SlowestStepSec = 0;
+    SlowestPhase = EScanPhase::Waiting;
+    OverBudgetFrames = 0;
     Snapshot.bScanning = false;
     Snapshot.bTruncated = false;
     Snapshot.Regions.Reset();
     SurveyWater.Reset();
     SurveyQuery = FCollisionQueryParams();
+    SurveyBounds = FBox(ForceInit);
+    VisibleBounds = FBox(ForceInit);
+    SurveyDimensions = FIntPoint::ZeroValue;
     Snapshot.bSurveying = false;
     NextSurveyCell = 0;
 }
@@ -60,78 +81,142 @@ void UWandererMapComponent::TickComponent(
     float InDeltaTime, ELevelTick InTickType, FActorComponentTickFunction* InThisTickFunction)
 {
     Super::TickComponent(InDeltaTime, InTickType, InThisTickFunction);
+    const double Deadline = FPlatformTime::Seconds() + UE::Wanderer::MapScan::FrameBudgetSeconds;
     const APlayerController* Controller = Cast<APlayerController>(GetOwner());
-    ACharacter* Character = Controller ? Cast<ACharacter>(Controller->GetPawn()) : nullptr;
-    if (!Character || !Controller->IsLocalController())
-    {
-        if (ScanCharacterWeakPtr.IsValid() || !Snapshot.Cells.IsEmpty())
-        {
-            Rescan();
-        }
-        return;
-    }
-    if (!bNeedsScan && ScanCharacterWeakPtr.Get() != Character)
+    ACharacter* Character = Controller && Controller->IsLocalController()
+        ? Cast<ACharacter>(Controller->GetPawn()) : nullptr;
+    if (bLevelSetChanged || ((Phase != EScanPhase::Waiting || ScanCharacterWeakPtr.IsValid())
+            && (!IsValid(Character) || ScanCharacterWeakPtr.Get() != Character)))
     {
         Rescan();
     }
-    if (bNeedsScan && !StartScan(*Character))
+    const UWorld* World = GetWorld();
+    if (!IsValid(Character) || !World || World->bIsTearingDown)
     {
         return;
     }
-    if (!Snapshot.bScanning && !Snapshot.bSurveying)
+    if (Phase == EScanPhase::Waiting)
     {
-        return;
+        StartScan(*Character);
     }
-    // The deadline bounds incremental cells, not scene enumeration or the entrance pass.
-    const double Deadline = FPlatformTime::Seconds() + UE::Wanderer::MapScan::FrameBudgetSeconds;
-    while (Snapshot.bSurveying && FPlatformTime::Seconds() < Deadline)
-    {
-        SampleSurveyCell();
-    }
-    while (Snapshot.bScanning && NextCell < Snapshot.Cells.Num()
-           && Snapshot.Cells.Num() < MaximumCells && FPlatformTime::Seconds() < Deadline)
-    {
-        ExpandCell(NextCell++);
-    }
-    if (Snapshot.bScanning
-        && (NextCell >= Snapshot.Cells.Num() || Snapshot.Cells.Num() >= MaximumCells))
-    {
-        Snapshot.bTruncated |= Snapshot.Cells.Num() >= MaximumCells;
-        Snapshot.bScanning = false;
-        FindEntrances();
-    }
+    AdvanceScan(Deadline);
 }
 
 void UWandererMapComponent::EndPlay(const EEndPlayReason::Type InEndPlayReason)
 {
+    FWorldDelegates::LevelAddedToWorld.RemoveAll(this);
+    FWorldDelegates::LevelRemovedFromWorld.RemoveAll(this);
     SetComponentTickEnabled(false);
     Rescan();
-    bNeedsScan = false;
     Super::EndPlay(InEndPlayReason);
 }
 
-bool UWandererMapComponent::StartScan(ACharacter& InCharacter)
+void UWandererMapComponent::OnScanLevelChanged(ULevel*, UWorld* InWorld)
+{
+    if (InWorld && InWorld == GetWorld())
+    {
+        bLevelSetChanged = true;
+    }
+}
+
+void UWandererMapComponent::StartScan(ACharacter& InCharacter)
 {
     if (!InCharacter.GetCharacterMovement()->IsMovingOnGround())
     {
-        return false;
+        return;
     }
     ScanCharacterWeakPtr = &InCharacter;
+    Snapshot.CellSize = CellSize;
     Radius = InCharacter.GetCapsuleComponent()->GetScaledCapsuleRadius();
     HalfHeight = InCharacter.GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
     StepHeight = InCharacter.GetCharacterMovement()->MaxStepHeight;
     WalkableFloorZ = InCharacter.GetCharacterMovement()->GetWalkableFloorZ();
-    Snapshot.Seed = InCharacter.GetActorLocation() - FVector(0, 0, HalfHeight);
-    FVector Floor;
-    if (!FindFloor(Snapshot.Seed, Floor))
-    {
-        return false;
-    }
-    AddCell(Floor);
-    bNeedsScan = false;
     Snapshot.bScanning = true;
-    StartSurvey();
-    return true;
+    Phase = EScanPhase::Seed;
+}
+
+void UWandererMapComponent::AdvanceScan(double InDeadline)
+{
+    TRACE_CPUPROFILER_EVENT_SCOPE(WandererMapAdvanceScan);
+    double Now = FPlatformTime::Seconds();
+    const EScanPhase InitialPhase = Phase;
+    while (IsScanning() && !bLevelSetChanged && Now < InDeadline)
+    {
+        const EScanPhase StepPhase = Phase;
+        const double StepStart = Now;
+        AdvanceScanStep();
+        Now = FPlatformTime::Seconds();
+        if (Now - StepStart > SlowestStepSec)
+        {
+            SlowestStepSec = Now - StepStart;
+            SlowestPhase = StepPhase;
+        }
+        if (Now > InDeadline)
+        {
+            ++OverBudgetFrames;
+        }
+    }
+    if (InitialPhase != EScanPhase::Complete && Phase == EScanPhase::Complete)
+    {
+        UE_LOG(LogWandererMapScan, Verbose,
+            TEXT("Scan completed: %d frames over budget, slowest step %.3f ms (phase %d)."),
+            OverBudgetFrames, SlowestStepSec * 1000.0, static_cast<int32>(SlowestPhase));
+    }
+}
+
+void UWandererMapComponent::AdvanceScanStep()
+{
+    switch (Phase)
+    {
+    case EScanPhase::Seed:
+        TrySeedScan();
+        break;
+    case EScanPhase::Bounds:
+        AdvanceSurveyBounds();
+        break;
+    case EScanPhase::Survey:
+        SampleSurveyCell();
+        if (!Snapshot.bSurveying)
+        {
+            Phase = EScanPhase::Reachable;
+        }
+        break;
+    case EScanPhase::Reachable:
+        if (NextCell < Snapshot.Cells.Num() && Snapshot.Cells.Num() < MaximumCells)
+        {
+            ExpandCell(NextCell++);
+        }
+        else
+        {
+            Snapshot.bTruncated |= Snapshot.Cells.Num() >= MaximumCells;
+            Phase = EScanPhase::Entrances;
+        }
+        break;
+    case EScanPhase::Entrances:
+        AdvanceEntranceScan();
+        break;
+    default:
+        break;
+    }
+}
+
+void UWandererMapComponent::TrySeedScan()
+{
+    const ACharacter* Character = ScanCharacterWeakPtr.Get();
+    FVector Floor;
+    if (Character && Character->GetCharacterMovement()->IsMovingOnGround())
+    {
+        Snapshot.Seed = Character->GetActorLocation() - FVector(0, 0, HalfHeight);
+        if (FindFloor(Snapshot.Seed, Floor))
+        {
+            AddCell(Floor);
+            BeginSurveyBounds();
+            Phase = EScanPhase::Bounds;
+            return;
+        }
+    }
+    Snapshot.bScanning = false;
+    Phase = EScanPhase::Waiting;
 }
 
 bool UWandererMapComponent::FindFloor(const FVector& InPosition, FVector& OutFloor) const
@@ -209,47 +294,58 @@ void UWandererMapComponent::AddCell(const FVector& InFloor)
     Snapshot.MapBounds += FVector2D(InFloor.X, InFloor.Y);
 }
 
-void UWandererMapComponent::FindEntrances()
+void UWandererMapComponent::AdvanceEntranceScan()
 {
-    for (TActorIterator<AActor> Actor(GetWorld()); Actor; ++Actor)
+    if (NextDoor >= DoorCandidates.Num())
     {
-        TInlineComponentArray<UStaticMeshComponent*> Components(*Actor);
-        for (const UStaticMeshComponent* Component : Components)
+        DoorCandidates.Reset();
+        EntranceBuckets.Reset();
+        Snapshot.bScanning = false;
+        Phase = EScanPhase::Complete;
+        return;
+    }
+    if (const UStaticMeshComponent* Door = DoorCandidates[NextDoor++].Get();
+        Door && Door->IsRegistered() && Door->GetWorld() == GetWorld()
+        && Door->GetStaticMesh() && Door->GetStaticMesh()->GetName().Contains(TEXT("Door")))
+    {
+        TryAddEntrance(*Door);
+    }
+}
+
+void UWandererMapComponent::TryAddEntrance(const UStaticMeshComponent& InMesh)
+{
+    FVector Min;
+    FVector Max;
+    InMesh.GetLocalBounds(Min, Max);
+    const FTransform Transform = InMesh.GetComponentTransform();
+    const FVector Center = Transform.TransformPosition(
+        FVector((Min.X + Max.X) / 2, (Min.Y + Max.Y) / 2, Min.Z));
+    const FVector Axis = Transform.TransformVectorNoScale(
+        (Max.X - Min.X < Max.Y - Min.Y) ? FVector::ForwardVector : FVector::RightVector);
+    FVector Front;
+    FVector Back;
+    if (!FindFloor(Center + Axis * (Radius + CellSize), Front)
+        || !FindFloor(Center - Axis * (Radius + CellSize), Back)
+        || !HasCell(GetCellKey(Front)) || !HasCell(GetCellKey(Back)) || !CanTraverse(Front, Back))
+    {
+        return;
+    }
+
+    using namespace UE::Wanderer::MapScan;
+    const FInt64Point Key(FMath::FloorToInt64(Center.X / EntranceMergeDistance),
+        FMath::FloorToInt64(Center.Y / EntranceMergeDistance));
+    for (int32 X = -1; X <= 1; ++X)
+    {
+        for (int32 Y = -1; Y <= 1; ++Y)
         {
-            if (!Component->GetStaticMesh()
-                || !Component->GetStaticMesh()->GetName().Contains(TEXT("Door")))
+            const auto* Points = EntranceBuckets.Find(Key + FInt64Point(X, Y));
+            if (Points && Points->ContainsByPredicate([&Center](const FVector& InExisting)
+                { return FVector::DistSquared2D(Center, InExisting) < EntranceMergeDistanceSquared; }))
             {
-                continue;
-            }
-            FVector Min;
-            FVector Max;
-            Component->GetLocalBounds(Min, Max);
-            const FTransform Transform = Component->GetComponentTransform();
-            const FVector Center = Transform.TransformPosition(
-                FVector((Min.X + Max.X) / 2, (Min.Y + Max.Y) / 2, Min.Z));
-            const FVector Axis = Transform.TransformVectorNoScale(
-                (Max.X - Min.X < Max.Y - Min.Y) ? FVector::ForwardVector : FVector::RightVector);
-            FVector Front;
-            FVector Back;
-            if (!FindFloor(Center + Axis * (Radius + CellSize), Front)
-                || !FindFloor(Center - Axis * (Radius + CellSize), Back))
-            {
-                continue;
-            }
-            if (!HasCell(GetCellKey(Front)) || !HasCell(GetCellKey(Back))
-                || !CanTraverse(Front, Back))
-            {
-                continue;
-            }
-            if (!Snapshot.Entrances.ContainsByPredicate(
-                    [Center](const FVector& Existing)
-                    {
-                        return FVector::DistSquared2D(Center, Existing)
-                               < UE::Wanderer::MapScan::EntranceMergeDistanceSquared;
-                    }))
-            {
-                Snapshot.Entrances.Add(Center);
+                return;
             }
         }
     }
+    EntranceBuckets.FindOrAdd(Key).Add(Center);
+    Snapshot.Entrances.Add(Center);
 }

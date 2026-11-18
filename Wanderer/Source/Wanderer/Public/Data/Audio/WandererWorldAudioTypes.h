@@ -80,6 +80,12 @@ struct WANDERER_API FWandererWorldAudioProfileRow : public FTableRowBase
         Category = "Playback",
         meta = (ClampMin = "0", ClampMax = "2", Units = "s", DisplayName = "FadeOutSeconds"))
     float FadeOutSec = .15f;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Playback",
+        meta = (ClampMin = "0", ClampMax = "2", Units = "s"))
+    float FadeInSec = .35f;
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Playback",
+        meta = (ClampMin = "0", Units = "s"))
+    float ReverbTailHoldSec = 0;
     /** Native radial spread radius for Area mode; unrelated to boundary gain. */
     UPROPERTY(
         EditAnywhere, BlueprintReadOnly, Category = "Area", meta = (ClampMin = "0.01", Units = "m"))

@@ -1,40 +1,24 @@
 #include "Features/AudioManager/InteriorFitAudioSyncService.h"
 
 #include "Editor.h"
+#include "Engine/Engine.h"
+#include "Engine/Level.h"
 #include "Engine/World.h"
-#include "EngineUtils.h"
+#include "HAL/PlatformTime.h"
 #include "UObject/UObjectGlobals.h"
 
+#include "InteriorFitArea.h"
+#include "InteriorFitSplineGuide.h"
+
+#include "Actors/Audio/WandererAudioAreaEmitter.h"
+#include "Components/WorldAudio/WandererAudioSourceComponent.h"
 #include "Features/AudioManager/InteriorFitGeometryImportOperation.h"
 
 namespace
 {
-    constexpr float PollIntervalSec = 1.0f;
-
-    FString WorldSnapshot(UWorld& InWorld)
-    {
-        TArray<FString> Rows;
-        for (TActorIterator<AActor> It(&InWorld); It; ++It)
-        {
-            if (FInteriorFitGeometryImportOperation::IsSource(*It))
-            {
-                FString Tags;
-                for (FName Tag : It->Tags)
-                {
-                    if (Tag.ToString().StartsWith(TEXT("InteriorFitProof_")))
-                    {
-                        Tags = Tag.ToString();
-                        break;
-                    }
-                }
-                Rows.Add(It->GetPathName() + Tags
-                         + FInteriorFitGeometryImportOperation::Fingerprint(*It));
-            }
-        }
-        Rows.Sort();
-        return FString::Join(Rows, TEXT("|"));
-    }
-} // namespace
+    constexpr float InteriorFitPollIntervalSec = 1.0f;
+    constexpr double InteriorFitFallbackScanIntervalSec = 10.0;
+}
 
 FInteriorFitAudioSyncService::~FInteriorFitAudioSyncService()
 {
@@ -49,62 +33,132 @@ void FInteriorFitAudioSyncService::Start()
     }
     bStopped = false;
     ++Generation;
+    FCoreUObjectDelegates::OnObjectPropertyChanged.AddSP(this, &FInteriorFitAudioSyncService::OnPropertyChanged);
+    FEditorDelegates::PostUndoRedo.AddSP(this, &FInteriorFitAudioSyncService::MarkDirty);
+    if (GEngine)
+    {
+        GEngine->OnLevelActorAdded().AddSP(this, &FInteriorFitAudioSyncService::OnActorChanged);
+        GEngine->OnLevelActorDeleted().AddSP(this, &FInteriorFitAudioSyncService::OnActorChanged);
+        GEngine->OnActorMoved().AddSP(this, &FInteriorFitAudioSyncService::OnActorChanged);
+    }
     Handle = FTSTicker::GetCoreTicker().AddTicker(
         FTickerDelegate::CreateSP(AsShared(), &FInteriorFitAudioSyncService::Tick),
-        PollIntervalSec);
+        InteriorFitPollIntervalSec);
 }
 
 void FInteriorFitAudioSyncService::Stop()
 {
-    bStopped = true;
-    ++Generation;
-    FTSTicker::GetCoreTicker().RemoveTicker(Handle);
-    Handle.Reset();
-    LastWorld.Reset();
-    LastSnapshot.Reset();
-}
-
-bool FInteriorFitAudioSyncService::Tick(float InDeltaSeconds)
-{
     if (bStopped)
     {
-        return false;
+        return;
     }
-    if (!GEditor || GEditor->PlayWorld || IsRunningCommandlet() || IsGarbageCollecting()
-        || GIsTransacting || GEditor->IsTransactionActive() || GIsAutomationTesting)
+    bStopped = true;
+    ++Generation;
+    FCoreUObjectDelegates::OnObjectPropertyChanged.RemoveAll(this);
+    FEditorDelegates::PostUndoRedo.RemoveAll(this);
+    if (GEngine)
     {
-        return true;
+        GEngine->OnLevelActorAdded().RemoveAll(this);
+        GEngine->OnLevelActorDeleted().RemoveAll(this);
+        GEngine->OnActorMoved().RemoveAll(this);
     }
-    UWorld* World = GEditor->GetEditorWorldContext().World();
-    if (!World || World->WorldType != EWorldType::Editor)
+    FTSTicker::GetCoreTicker().RemoveTicker(Handle);
+    Handle.Reset();
+    ResetWorldState();
+}
+
+bool FInteriorFitAudioSyncService::Tick(float)
+{
+    if (!bStopped && GEditor && !GEditor->PlayWorld && !IsRunningCommandlet()
+        && !IsGarbageCollecting() && !GIsTransacting && !GEditor->IsTransactionActive()
+        && !GIsAutomationTesting)
     {
-        return true;
+        UWorld* World = GEditor->GetEditorWorldContext().World();
+        if (World && World->WorldType == EWorldType::Editor && !World->bIsTearingDown)
+        {
+            PollWorld(*World, FPlatformTime::Seconds());
+        }
     }
-    const TWeakObjectPtr<UWorld> WorldWeakPtr = World;
-    const uint64 ActiveGeneration = Generation;
-    const FString Snapshot = WorldSnapshot(*World);
-    const TWeakPtr<FInteriorFitAudioSyncService> WeakService = AsShared();
-    if (LastWorld.Get() == World && LastSnapshot == Snapshot)
+    return !bStopped;
+}
+
+void FInteriorFitAudioSyncService::PollWorld(UWorld& InWorld, double InNowSec)
+{
+    if (bStopped || bApplying)
     {
-        // Two stable polls avoid copying partially generated or actively dragged geometry.
-        Reconcile(World,
-                  [WeakService, ActiveGeneration]
-                  {
-                      const TSharedPtr<FInteriorFitAudioSyncService> Service = WeakService.Pin();
-                      return Service && !Service->bStopped
-                             && Service->Generation == ActiveGeneration;
-                  });
+        return;
     }
-    if (bStopped || Generation != ActiveGeneration)
+    if (LastWorld.Get() != &InWorld)
     {
-        return false;
+        ResetWorldState();
+        LastWorld = &InWorld;
     }
-    if (!WorldWeakPtr.IsValid() || !GEditor
-        || WorldWeakPtr.Get() != GEditor->GetEditorWorldContext().World())
+    if (!bDirty && !bNeedsConfirmation && InNowSec < NextScanAtSec
+        && (RetryAtSec == 0 || InNowSec < RetryAtSec))
     {
-        return true;
+        return;
     }
-    LastWorld = WorldWeakPtr;
-    LastSnapshot = Snapshot;
-    return true;
+    bDirty = false;
+    NextScanAtSec = InNowSec + InteriorFitFallbackScanIntervalSec;
+    Sample(InWorld, InNowSec);
+}
+
+void FInteriorFitAudioSyncService::ResetWorldState()
+{
+    LastWorld.Reset();
+    LastSample.Reset();
+    AppliedGroups.Reset();
+    bDirty = true;
+    bNeedsConfirmation = true;
+    bHasSample = false;
+    NextScanAtSec = 0;
+    RetryAtSec = 0;
+}
+
+void FInteriorFitAudioSyncService::MarkDirty()
+{
+    if (IsInGameThread() && !bStopped)
+    {
+        bDirty = true;
+    }
+}
+
+void FInteriorFitAudioSyncService::OnActorChanged(AActor* InActor)
+{
+    if (!IsInGameThread() || !InActor || InActor->GetWorld() != LastWorld.Get())
+    {
+        return;
+    }
+    // Deleted actors may already fail IsSource's validity check, and audio Areas inherit the plugin class.
+    const bool bSourceClass = InActor->IsA<AInteriorFitSplineGuide>()
+        || (InActor->IsA<AInteriorFitArea>() && !InActor->IsA<AWandererAudioAreaEmitter>());
+    if (bSourceClass
+        || (!bApplying && InActor->FindComponentByClass<UWandererAudioSourceComponent>()))
+    {
+        MarkDirty();
+    }
+}
+
+void FInteriorFitAudioSyncService::OnPropertyChanged(UObject* InObject, FPropertyChangedEvent&)
+{
+    if (!IsInGameThread() || !InObject || InObject->GetWorld() != LastWorld.Get())
+    {
+        return;
+    }
+    if (InObject->IsA<ULevel>())
+    {
+        if (!bApplying)
+        {
+            MarkDirty();
+        }
+        return;
+    }
+    AActor* Actor = Cast<AActor>(InObject);
+    Actor = Actor ? Actor : InObject->GetTypedOuter<AActor>();
+    if (FInteriorFitGeometryImportOperation::IsSource(Actor)
+        || (!bApplying && (InObject->IsA<UWandererAudioSourceComponent>()
+            || (Actor && Actor->FindComponentByClass<UWandererAudioSourceComponent>()))))
+    {
+        MarkDirty();
+    }
 }

@@ -12,6 +12,7 @@
 #include "Components/WorldAudio/WandererAudioSourceComponent.h"
 #include "Interfaces/Audio/AudioGeometryProvider.h"
 
+// 按运行世界绘制播放关系，便于核对声源位置
 void FAudioVisualizationController::DrawNow()
 {
     if (bStopped || !bEnabled)

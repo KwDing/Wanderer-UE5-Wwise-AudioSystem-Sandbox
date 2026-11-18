@@ -79,7 +79,7 @@ namespace
     }
 
     FGameLogRegistration Feature;
-    FEditorFeatureRegistration Registration(
+    FEditorFeatureRegistration GameLogFeatureRegistration(
         TEXT("GameLog"),
         []
         {

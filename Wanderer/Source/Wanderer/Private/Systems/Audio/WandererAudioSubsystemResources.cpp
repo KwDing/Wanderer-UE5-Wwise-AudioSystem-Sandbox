@@ -6,6 +6,7 @@
 
 #include "Systems/Audio/AudioEventLeaseManager.h"
 #include "Systems/Audio/AudioSchedulingStateTypes.h"
+#include "Systems/Audio/WwiseAudioBackend.h"
 
 namespace
 {
@@ -23,6 +24,7 @@ FString UWandererAudioSubsystem::GetResourceSummary() const
     FString Result = FString::Printf(TEXT("\nManaged resource Events: %d | %s"),
                                      EventLeaseManager ? EventLeaseManager->GetEventCount() : 0,
                                      *ResourceConfigError);
+    Result += TEXT(" | ") + UAudioEventLeaseManager::GetLoadSummary();
     for (const TPair<FName, FWandererAudioResourceState>& Pair : ResourceState->Groups)
     {
         const FWandererAudioResourceState& State = Pair.Value;
@@ -50,7 +52,7 @@ bool UWandererAudioSubsystem::IsResourceGroupActive(FName Group) const
 
 bool UWandererAudioSubsystem::IsEventDataResident(UAkAudioEvent* Event) const
 {
-    return IsValid(Event) && Event->IsLoaded() && Event->IsDataFullyLoaded();
+    return UAudioEventLeaseManager::IsReady(Event);
 }
 
 FString UWandererAudioSubsystem::GetResourceGroupStatus(FName Group) const
@@ -101,6 +103,26 @@ bool UWandererAudioSubsystem::AcquireEventResource(UAkAudioEvent* InEvent)
         EventLeaseManager = NewObject<UAudioEventLeaseManager>(this);
     }
     return EventLeaseManager->Acquire(InEvent);
+}
+
+EAudioEventResourceStatus UWandererAudioSubsystem::AdvanceEventResource(
+    UAkAudioEvent* InEvent, float InPriority)
+{
+    return EventLeaseManager && !bDeinitializing ? EventLeaseManager->Advance(InEvent, InPriority)
+                                                 : EAudioEventResourceStatus::Failed;
+}
+
+uint32 UWandererAudioSubsystem::PostPreparedEvent(
+    UAkAudioEvent& InEvent, UAkGameObject* InObject, float InFadeInSec)
+{
+    const uint32 PlayingID = bDeinitializing ? 0 : UAudioEventLeaseManager::Post(InEvent, InObject);
+    if (PlayingID && InFadeInSec > 0 && !WandererAudioBackend::FadeInPlayback(
+        PlayingID, FMath::RoundToInt(InFadeInSec * 1000)))
+    {
+        WandererAudioBackend::StopPlayback(PlayingID, 0);
+        // Preserve the accepted ID until the caller observes completion and retires its lease.
+    }
+    return PlayingID;
 }
 
 void UWandererAudioSubsystem::ReleaseEventResource(UAkAudioEvent* InEvent)

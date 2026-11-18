@@ -7,6 +7,7 @@
 #include "AkAudioEvent.h"
 
 #include "Interfaces/Audio/AudioSourceInterface.h"
+#include "Systems/Audio/AudioEmitterPool.h"
 #include "Systems/Audio/AudioSchedulingStateTypes.h"
 
 namespace
@@ -27,10 +28,19 @@ void UWandererAudioSubsystem::UpdateGroup(const FWandererAudioResourceGroup& InG
         {
             return;
         }
+        if (State.Phase == EPhase::Loading)
+        {
+            ReleaseGroup(State);
+            return;
+        }
         State.Phase = EPhase::Draining;
         if (IsResourceGroupPlaying(InGroup.Name))
         {
             return;
+        }
+        if (EmitterPool)
+        {
+            EmitterPool->SuspendIdleGroup(InGroup.Name);
         }
         SetSpatialResources(InGroup, false);
         ReleaseGroup(State);
@@ -100,6 +110,9 @@ void UWandererAudioSubsystem::AdvanceGroupLoad(const FWandererAudioResourceGroup
 bool UWandererAudioSubsystem::AcquirePreloadEvents(const FWandererAudioResourceGroup& InGroup,
                                                    FWandererAudioResourceState& InOutState)
 {
+    bool bAllReady = true;
+    bool bAnyFailed = false;
+    const double Now = GetWorld()->GetTimeSeconds();
     for (const TSoftObjectPtr<UAkAudioEvent>& Reference : InGroup.PreloadEvents)
     {
         UAkAudioEvent* Event = Reference.Get();
@@ -109,31 +122,45 @@ bool UWandererAudioSubsystem::AcquirePreloadEvents(const FWandererAudioResourceG
             return false;
         }
 
-        if (InOutState.Leases.Contains(Event))
+        if (!InOutState.Leases.Contains(Event))
         {
-            continue;
+            if (Now < InOutState.RetryAtSec || !AcquireEventResource(Event))
+            {
+                bAllReady = false;
+                bAnyFailed = true;
+                continue;
+            }
+            InOutState.Leases.Add(Event);
         }
-
-        if (GetWorld()->GetTimeSeconds() < InOutState.RetryAtSec)
+        const EAudioEventResourceStatus Status = AdvanceEventResource(Event,
+            AudioSchedulingDefaults::PreloadPriority - InOutState.DistanceM);
+        bAllReady &= Status == EAudioEventResourceStatus::Ready;
+        if (Status == EAudioEventResourceStatus::Failed)
         {
-            return false;
+            InOutState.Leases.Remove(Event);
+            ReleaseEventResource(Event);
+            bAnyFailed = true;
         }
-
-        if (!AcquireEventResource(Event))
-        {
-            InOutState.Error = TEXT("Wwise data unavailable");
-            InOutState.RetryAtSec = GetWorld()->GetTimeSeconds() + EventRetryDelaySec;
-            return false;
-        }
-
-        InOutState.Leases.Add(Event);
     }
-
-    return true;
+    if (bAnyFailed && Now >= InOutState.RetryAtSec)
+    {
+        InOutState.RetryAtSec = Now + EventRetryDelaySec;
+    }
+    InOutState.Error = bAnyFailed ? TEXT("Wwise data unavailable")
+                                  : bAllReady ? FString() : TEXT("Loading Wwise media");
+    return bAllReady;
 }
 
 bool UWandererAudioSubsystem::IsResourceGroupPlaying(FName InGroup) const
 {
+    if (IsObjectGroupPlaying(InGroup))
+    {
+        return true;
+    }
+    if (EmitterPool && EmitterPool->HasPendingGroup(InGroup))
+    {
+        return true;
+    }
     for (const TWeakObjectPtr<UObject>& SourceWeakPtr : SourcesWeakPtrs)
     {
         const IAudioSourceInterface* Source = Cast<IAudioSourceInterface>(SourceWeakPtr.Get());
@@ -159,7 +186,8 @@ void UWandererAudioSubsystem::BeginGroupLoad(const FWandererAudioResourceGroup& 
     }
 
     InOutState.LoadHandle =
-        Paths.IsEmpty() ? nullptr : UAssetManager::GetStreamableManager().RequestAsyncLoad(Paths);
+        Paths.IsEmpty() ? nullptr : UAssetManager::GetStreamableManager().RequestAsyncLoad(
+            Paths, FStreamableDelegate(), -10);
     InOutState.LoadStartedAtSec = GetWorld()->GetTimeSeconds();
     InOutState.Phase = FWandererAudioResourceState::EPhase::Loading;
     InOutState.Error.Reset();

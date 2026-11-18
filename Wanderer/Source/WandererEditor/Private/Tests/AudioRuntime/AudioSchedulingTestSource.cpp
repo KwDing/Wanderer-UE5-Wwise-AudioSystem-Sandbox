@@ -32,7 +32,7 @@ int32 UAudioSchedulingTestSource::GetPlayingID() const
     return PlayingID;
 }
 
-UObject* UAudioSchedulingTestSource::GetPlaybackIdentity()
+const UObject* UAudioSchedulingTestSource::GetPlaybackIdentity() const
 {
     return PlaybackIdentity;
 }
@@ -41,6 +41,11 @@ bool UAudioSchedulingTestSource::CollectAudioRoomPaths(TArray<FSoftObjectPath>& 
 {
     OutPaths = RoomPaths;
     return true;
+}
+
+bool UAudioSchedulingTestSource::PrepareForAdmission(bool bInNight)
+{
+    return bMediaReady;
 }
 
 void UAudioSchedulingTestSource::UpdatePlayback(bool bInAdmitted, FName InReason, bool bInNight)

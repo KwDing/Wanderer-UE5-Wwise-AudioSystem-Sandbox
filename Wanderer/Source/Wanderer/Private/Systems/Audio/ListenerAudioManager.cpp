@@ -1,14 +1,18 @@
 #include "Systems/Audio/ListenerAudioManager.h"
 
+#include "Engine/AssetManager.h"
+#include "Engine/StreamableManager.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/ScopeExit.h"
 #include "Templates/UnrealTemplate.h"
 #include "UObject/StrongObjectPtr.h"
 
-#include "AkAudioDevice.h"
 #include "AkAudioEvent.h"
 
 #include "Core/Diagnostics/DiagnosticRecorder.h"
+#include "Interfaces/Audio/AudioOutputService.h"
+#include "Systems/Audio/AudioEventLeaseManager.h"
+#include "Systems/Audio/WwiseAudioBackend.h"
 
 namespace
 {
@@ -16,7 +20,8 @@ namespace
     constexpr double WaterStateTimeUnsetSec = -1.0;
     TWeakObjectPtr<UListenerAudioManager> UnderwaterMixOwner;
     TWeakObjectPtr<UListenerAudioManager> MenuMixOwner;
-    TSoftObjectPtr<UAkAudioEvent> PendingResumeEventSoftPtr;
+    TStrongObjectPtr<UAkAudioEvent> DeferredMenuResumeEvent;
+    TStrongObjectPtr<UAudioEventLeaseManager> DeferredMenuResumeLeases;
     bool bResumePending = false;
     bool bDuckResetPending = false;
     bool bWaterResetPending = false;
@@ -28,29 +33,26 @@ namespace
         {
             return true;
         }
-        FAkAudioDevice* Audio = FAkAudioDevice::Get();
-        if (Audio && FAkAudioDevice::IsInitialized())
-        {
-            bWaterResetPending = Audio->SetState(
-                TEXT("ListenerEnvironment"), TEXT("AboveWater")) != AK_Success;
-        }
+        bWaterResetPending = !WandererAudioOutput::TrySetListenerUnderwater(false);
         return !bWaterResetPending;
     }
 
-    bool TryPostMenuEvent(UAkAudioEvent* InEvent, const bool* InStopFlag = nullptr)
+    bool TryPostMenuEvent(UAkAudioEvent* InEvent, UAudioEventLeaseManager* InLeases,
+        const bool* InStopFlag = nullptr)
     {
         const TStrongObjectPtr<UAkAudioEvent> Event(InEvent);
-        if (!Event.IsValid() || !FAkAudioDevice::IsInitialized())
+        if (!Event.IsValid() || !WandererAudioOutput::IsReady()
+            || !UAudioEventLeaseManager::IsReady(Event.Get()) || (InStopFlag && *InStopFlag))
         {
             return false;
         }
-        if (!Event->IsLoaded())
+        const bool bKeepPlaying = InLeases && InLeases->Acquire(Event.Get());
+        const uint32 PlayingID = UAudioEventLeaseManager::Post(*Event);
+        if (bKeepPlaying)
         {
-            Event->LoadData();
+            InLeases->Retire(Event.Get(), PlayingID, -1, 0);
         }
-        return (!InStopFlag || !*InStopFlag) && Event->IsLoaded()
-               && Event->PostAmbient(
-                   nullptr, nullptr, nullptr, static_cast<AkCallbackType>(0), nullptr);
+        return PlayingID != 0;
     }
 
     bool RetryMenuRecovery()
@@ -60,22 +62,92 @@ namespace
             return false;
         }
         const TGuardValue<bool> Guard(bRecoveringMenu, true);
-        FAkAudioDevice* Audio = FAkAudioDevice::Get();
-        if (!Audio || !FAkAudioDevice::IsInitialized())
+        if (!WandererAudioBackend::IsDeviceReady())
         {
             return !bResumePending && !bDuckResetPending;
         }
         if (bDuckResetPending)
         {
-            bDuckResetPending = Audio->SetState(TEXT("Audio_Duck"), TEXT("None")) != AK_Success;
+            bDuckResetPending = !WandererAudioOutput::TrySetMenuMix(EListenerMenuMode::Closed);
         }
-        if (bResumePending && TryPostMenuEvent(PendingResumeEventSoftPtr.LoadSynchronous()))
+        if (bResumePending && TryPostMenuEvent(DeferredMenuResumeEvent.Get(), DeferredMenuResumeLeases.Get()))
         {
             bResumePending = false;
-            PendingResumeEventSoftPtr.Reset();
+            DeferredMenuResumeEvent.Reset();
+            if (DeferredMenuResumeLeases)
+            {
+                DeferredMenuResumeLeases->Stop();
+                DeferredMenuResumeLeases.Reset();
+            }
         }
         return !bResumePending && !bDuckResetPending;
     }
+}
+
+void UListenerAudioManager::PrepareMenuEvents(const TSoftObjectPtr<UAkAudioEvent>& InPause,
+    const TSoftObjectPtr<UAkAudioEvent>& InResume)
+{
+    if (bStopped || MenuEventLeases || InPause.IsNull() || InResume.IsNull())
+    {
+        return;
+    }
+    PauseMenuReference = InPause;
+    ResumeMenuReference = InResume;
+    // A recovery claim can outlive the controller and must not retain its outer chain.
+    MenuEventLeases = NewObject<UAudioEventLeaseManager>();
+    const TArray<FSoftObjectPath> Paths = {InPause.ToSoftObjectPath(), InResume.ToSoftObjectPath()};
+    MenuLoadHandle = UAssetManager::GetStreamableManager().RequestAsyncLoad(Paths);
+    MenuPreloadTicker = FTSTicker::GetCoreTicker().AddTicker(
+        FTickerDelegate::CreateUObject(this, &UListenerAudioManager::AdvanceMenuPreload), .05f);
+}
+
+void UListenerAudioManager::SetMenuMode(EListenerMenuMode InMode)
+{
+    if (bStopped)
+    {
+        return;
+    }
+    RequestedMenuMode = InMode;
+    bAwaitingMenuPair = InMode == EListenerMenuMode::Paused
+        && (!UAudioEventLeaseManager::IsReady(PreparedPauseEvent)
+            || !UAudioEventLeaseManager::IsReady(PreparedResumeEvent));
+    if (!bAwaitingMenuPair)
+    {
+        SetMenuState(InMode, PreparedPauseEvent, PreparedResumeEvent);
+    }
+}
+
+bool UListenerAudioManager::AdvanceMenuPreload(float InDeltaSec)
+{
+    if (bStopped || !MenuEventLeases)
+    {
+        return false;
+    }
+    if (MenuLoadHandle)
+    {
+        if (!MenuLoadHandle->HasLoadCompleted())
+        {
+            return true;
+        }
+        if (MenuEventLeases->Acquire(PauseMenuReference.Get()))
+        {
+            PreparedPauseEvent = PauseMenuReference.Get();
+        }
+        if (MenuEventLeases->Acquire(ResumeMenuReference.Get()))
+        {
+            PreparedResumeEvent = ResumeMenuReference.Get();
+        }
+        MenuLoadHandle.Reset();
+    }
+    const EAudioEventResourceStatus PauseStatus = MenuEventLeases->Advance(PreparedPauseEvent);
+    const EAudioEventResourceStatus ResumeStatus = MenuEventLeases->Advance(PreparedResumeEvent);
+    if (bAwaitingMenuPair && PauseStatus == EAudioEventResourceStatus::Ready
+        && ResumeStatus == EAudioEventResourceStatus::Ready)
+    {
+        SetMenuMode(RequestedMenuMode);
+    }
+    RetryPendingMix();
+    return !bStopped;
 }
 
 void UListenerAudioManager::UpdateWater(const FListenerWaterSample& InSample)
@@ -168,9 +240,9 @@ void UListenerAudioManager::SetMenuState(
         FinishDeviceCall();
     };
     ResumeEvent = InResume;
-    if (bResumePending && PendingResumeEventSoftPtr.IsNull() && IsValid(InResume))
+    if (bResumePending && !DeferredMenuResumeEvent && UAudioEventLeaseManager::IsReady(InResume))
     {
-        PendingResumeEventSoftPtr = InResume;
+        DeferredMenuResumeEvent.Reset(InResume);
     }
     if (!RetryMenuRecovery() || bStopped)
     {
@@ -190,12 +262,9 @@ void UListenerAudioManager::SetMenuState(
     {
         return;
     }
-    const TCHAR* State = bPauseMenu ? TEXT("UI_Only") : bMenuOpen ? TEXT("UI_Focus") : TEXT("None");
     const bool bNewClaim = !MenuMixOwner.IsValid();
     MenuMixOwner = this;
-    FAkAudioDevice* Audio = FAkAudioDevice::Get();
-    const bool bMixApplied = Audio && FAkAudioDevice::IsInitialized()
-                            && Audio->SetState(TEXT("Audio_Duck"), State) == AK_Success;
+    const bool bMixApplied = WandererAudioOutput::TrySetMenuMix(InMode);
     const bool bWasPending = bMenuResumePending;
     bMenuResumePending = false;
     if (bMixApplied)
@@ -214,8 +283,8 @@ void UListenerAudioManager::SetMenuState(
         UE_CLOG(!bWasPending,
             LogWandererAudio,
             Warning,
-            TEXT("Cannot apply Audio_Duck/%s. Check Wwise initialization and Windows Init bank."),
-            State);
+            TEXT("Cannot apply menu mix (%s). Check Wwise initialization and Windows Init bank."),
+            bPauseMenu ? TEXT("Paused") : bMenuOpen ? TEXT("Focused") : TEXT("Closed"));
     }
     if (bMenuResumePending)
     {
@@ -241,6 +310,12 @@ void UListenerAudioManager::Stop(UAkAudioEvent* InResume)
 {
     const TStrongObjectPtr<UListenerAudioManager> KeepAlive(this);
     bStopped = true;
+    FTSTicker::GetCoreTicker().RemoveTicker(MenuPreloadTicker);
+    if (MenuLoadHandle)
+    {
+        MenuLoadHandle->CancelHandle();
+        MenuLoadHandle.Reset();
+    }
     bStopPending = true;
     bMenuResumePending = false;
     if (InResume)
@@ -287,13 +362,27 @@ void UListenerAudioManager::ReleaseMixClaims()
         {
             // Debt survives the controller. A future request must resume before claiming the mix.
             bResumePending = true;
-            PendingResumeEventSoftPtr = ResumeEvent.Get();
+            DeferredMenuResumeEvent.Reset(ResumeEvent.Get());
+            if (MenuEventLeases && PreparedPauseEvent)
+            {
+                MenuEventLeases->Release(PreparedPauseEvent);
+            }
+            DeferredMenuResumeLeases.Reset(MenuEventLeases);
+            MenuEventLeases = nullptr;
             bMenuAudioPaused = false;
         }
         MenuMixOwner.Reset();
     }
     ResetWater(true);
     const bool bMenuRecovered = RetryMenuRecovery();
+    if (MenuEventLeases)
+    {
+        MenuEventLeases->Stop();
+        MenuEventLeases = nullptr;
+    }
+    PreparedPauseEvent = nullptr;
+    PreparedResumeEvent = nullptr;
+    ResumeEvent = nullptr;
     UE_CLOG(!bMenuRecovered || bWaterResetPending,
         LogWandererAudio,
         Warning,
@@ -330,15 +419,12 @@ void UListenerAudioManager::ApplyWater(bool bInUnderwater, double InSampleTimeSe
     {
         return;
     }
-    FAkAudioDevice* Audio = FAkAudioDevice::Get();
-    if (!Audio || !FAkAudioDevice::IsInitialized())
+    if (!WandererAudioBackend::IsDeviceReady())
     {
         bWaterStateApplied = false;
         return;
     }
-    if (Audio->SetState(
-            TEXT("ListenerEnvironment"), bInUnderwater ? TEXT("Underwater") : TEXT("AboveWater"))
-        == AK_Success)
+    if (WandererAudioOutput::TrySetListenerUnderwater(bInUnderwater))
     {
         bEarsUnderwater = bInUnderwater;
         bWaterStateApplied = true;
@@ -356,7 +442,7 @@ bool UListenerAudioManager::SetMenuPaused(bool bInPaused, UAkAudioEvent* InEvent
     {
         return false;
     }
-    if (TryPostMenuEvent(InEvent, bInPaused ? &bStopped : nullptr))
+    if (TryPostMenuEvent(InEvent, MenuEventLeases, bInPaused ? &bStopped : nullptr))
     {
         bMenuAudioPaused = bInPaused;
         return true;

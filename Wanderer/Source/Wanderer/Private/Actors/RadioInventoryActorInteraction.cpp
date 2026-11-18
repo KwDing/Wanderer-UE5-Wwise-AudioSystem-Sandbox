@@ -6,6 +6,7 @@
 #include "Actors/WandererSpeakerActor.h"
 #include "Actors/WandererSpeakerPreviewActor.h"
 #include "Framework/WandererPlayerController.h"
+#include "Systems/Audio/WandererAudioSubsystem.h"
 
 bool ARadioInventoryActor::ExecuteRadioRequest(const FRadioControlRequest& InRequest)
 {
@@ -75,12 +76,33 @@ FRadioControlSnapshot ARadioInventoryActor::ReadRadioState() const
     if (SelectedSourceWeakPtr.IsValid())
     {
         State.SelectedID = SelectedSourceWeakPtr->GetDeviceID();
+        const AWandererSpeakerActor* Selected = SelectedSourceWeakPtr.Get();
+        const UWorld* World = GetWorld();
+        const auto* Audio = World ? World->GetSubsystem<UWandererAudioSubsystem>() : nullptr;
+        if (Audio && Selected->IsPlaybackRequested())
+        {
+            const ERadioPlaybackPhase Phase = Audio->GetRadioPlaybackPhase(
+                const_cast<ARadioInventoryActor*>(this), Selected->GetOptionID());
+            if (Phase == ERadioPlaybackPhase::LoadingMedia)
+            {
+                State.Status = TEXT("Loading radio audio.");
+            }
+            else if (Phase == ERadioPlaybackPhase::WaitingForEmitters)
+            {
+                State.Status = TEXT("Waiting for a radio emitter.");
+            }
+            else if (Phase == ERadioPlaybackPhase::WaitingForListener)
+            {
+                State.Status = TEXT("Waiting for the spatial audio listener.");
+            }
+        }
     }
     return State;
 }
 
 void ARadioInventoryActor::SetRadioPreviewEnabled(bool bInEnabled)
 {
+    bPreviewRequested = bInEnabled;
     if (!bInEnabled || bShuttingDown)
     {
         if (IsValid(PreviewStudio))
@@ -96,12 +118,16 @@ void ARadioInventoryActor::SetRadioPreviewEnabled(bool bInEnabled)
         return;
     }
     FActorSpawnParameters Parameters;
+    if (!PrepareSpeakerMeshes())
+    {
+        return;
+    }
     Parameters.Owner = this;
     Parameters.ObjectFlags |= RF_Transient;
     constexpr double StudioHeight = 1000000;
     PreviewStudio = GetWorld()->SpawnActor<AWandererSpeakerPreviewActor>(
         FVector(0, 0, StudioHeight), FRotator::ZeroRotator, Parameters);
-    if (!IsValid(PreviewStudio) || !PreviewStudio->ShowItems())
+    if (!IsValid(PreviewStudio) || !PreviewStudio->ShowItems(RadioMesh, MountedMesh))
     {
         UE_LOG(
             LogTemp, Warning, TEXT("Radio inventory previews could not load configured meshes."));

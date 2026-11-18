@@ -1,6 +1,6 @@
 #include "Components/WorldAudio/WandererAudioSourceComponent.h"
 
-#include "AkGameObject.h"
+#include "AkRoomComponent.h"
 
 FAudioSchedulingInfo UWandererAudioSourceComponent::GetSchedulingInfo() const
 {
@@ -30,9 +30,14 @@ FName UWandererAudioSourceComponent::GetAudioResourceGroup() const
     return ResourceGroup;
 }
 
-UObject* UWandererAudioSourceComponent::GetPlaybackIdentity()
+const UObject* UWandererAudioSourceComponent::GetPlaybackIdentity() const
 {
-    return GetPlaybackObject();
+    const FWandererWorldAudioProfileRow* Row = GetProfile();
+    if (Row && Row->Mode == EWandererWorldAudioMode::Room)
+    {
+        return ResolvePlaybackRoom();
+    }
+    return Row ? this : nullptr;
 }
 
 bool UWandererAudioSourceComponent::CollectAudioRoomPaths(TArray<FSoftObjectPath>& OutPaths) const

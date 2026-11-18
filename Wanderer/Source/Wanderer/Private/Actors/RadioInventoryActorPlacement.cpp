@@ -4,7 +4,9 @@
 #include "Components/PrimitiveComponent.h"
 #include "Components/ShapeComponent.h"
 #include "DrawDebugHelpers.h"
+#include "Engine/AssetManager.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/StreamableManager.h"
 #include "Engine/World.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/Volume.h"
@@ -14,6 +16,7 @@
 #include "Components/ItemPlacementComponent.h"
 #include "Data/WandererSpeakerSettings.h"
 #include "Framework/WandererPlayerController.h"
+#include "Systems/Audio/WandererAudioSubsystem.h"
 
 namespace RadioPlacementDefaults
 {
@@ -95,12 +98,11 @@ bool ARadioInventoryActor::BeginItemPlacement(EWandererSpeakerItem InItem)
         Status = TEXT("All sources deployed. Retrieve one first.");
         return false;
     }
-    RadioMesh = Settings->RadioMesh.LoadSynchronous();
-    MountedMesh = Settings->MountedMesh.LoadSynchronous();
-    if (!RadioMesh || !MountedMesh)
+    if (!PrepareSpeakerMeshes())
     {
-        Status = TEXT("Speaker models are missing. Check Speaker settings.");
-        return false;
+        PlacementItem = InItem;
+        bPlacementRequested = MeshRequest.IsValid();
+        return bPlacementRequested;
     }
     CancelPlacement();
     SelectedSourceWeakPtr.Reset();
@@ -126,6 +128,7 @@ bool ARadioInventoryActor::BeginItemPlacement(EWandererSpeakerItem InItem)
 
 void ARadioInventoryActor::CancelPlacement()
 {
+    bPlacementRequested = false;
     if (PreviewActorWeakPtr.IsValid())
     {
         Status = TEXT("Placement cancelled.");
@@ -136,6 +139,58 @@ void ARadioInventoryActor::CancelPlacement()
     }
     PreviewActorWeakPtr.Reset();
     bPreviewValid = false;
+}
+
+bool ARadioInventoryActor::PrepareSpeakerMeshes()
+{
+    const UWandererSpeakerSettings* Settings = GetDefault<UWandererSpeakerSettings>();
+    RadioMesh = Settings->RadioMesh.Get();
+    MountedMesh = Settings->MountedMesh.Get();
+    if (RadioMesh && MountedMesh)
+    {
+        return true;
+    }
+    const TArray<FSoftObjectPath> Paths{
+        Settings->RadioMesh.ToSoftObjectPath(), Settings->MountedMesh.ToSoftObjectPath()};
+    if (Paths[0].IsNull() || Paths[1].IsNull())
+    {
+        Status = TEXT("Speaker models are not configured.");
+        return false;
+    }
+    if (!MeshRequest)
+    {
+        MeshRequest = UAssetManager::GetStreamableManager().RequestAsyncLoad(Paths);
+    }
+    Status = MeshRequest ? TEXT("Loading speaker models.") : TEXT("Speaker model request failed.");
+    return false;
+}
+
+void ARadioInventoryActor::UpdateSpeakerMeshes()
+{
+    if (!MeshRequest || !MeshRequest->HasLoadCompleted() || bShuttingDown)
+    {
+        return;
+    }
+    const UWandererSpeakerSettings* Settings = GetDefault<UWandererSpeakerSettings>();
+    RadioMesh = Settings->RadioMesh.Get();
+    MountedMesh = Settings->MountedMesh.Get();
+    MeshRequest.Reset();
+    if (!RadioMesh || !MountedMesh)
+    {
+        Status = TEXT("Speaker models could not load.");
+        bPlacementRequested = false;
+        bPreviewRequested = false;
+        return;
+    }
+    if (bPlacementRequested)
+    {
+        bPlacementRequested = false;
+        BeginItemPlacement(PlacementItem);
+    }
+    if (bPreviewRequested)
+    {
+        SetRadioPreviewEnabled(true);
+    }
 }
 
 bool ARadioInventoryActor::ConfirmPlacement()
@@ -152,7 +207,17 @@ bool ARadioInventoryActor::ConfirmPlacement()
         return false;
     }
     AWandererSpeakerActor* Source = PreviewActorWeakPtr.Get();
-    Source->SetPreview(false);
+    TArray<FGuid>& ReturnedIDs = ReturnedDeviceIDs.FindOrAdd(Source->GetItemType());
+    const FGuid InstanceID = ReturnedIDs.IsEmpty() ? Source->GetDeviceID() : ReturnedIDs.Last();
+    if (!Source->ConfirmAudioPlacement(InstanceID))
+    {
+        Status = TEXT("Could not register the placed device's audio emitter.");
+        return false;
+    }
+    if (!ReturnedIDs.IsEmpty())
+    {
+        ReturnedIDs.Pop();
+    }
     SourcesWeakPtrs.RemoveAll(
         [](const TWeakObjectPtr<AWandererSpeakerActor>& EntryWeakPtr)
         {
@@ -175,6 +240,10 @@ bool ARadioInventoryActor::ConfirmPlacement()
         PendingOption = Settings->Options[0].ID;
     }
     SetSourceIntent(*Source, PendingOption, false);
+    if (UWandererAudioSubsystem* Audio = GetWorld()->GetSubsystem<UWandererAudioSubsystem>())
+    {
+        Audio->PreloadRadioPlayback(this);
+    }
     UpdatePairPlayback(0);
     PreviewActorWeakPtr.Reset();
     bPreviewValid = false;

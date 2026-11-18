@@ -8,6 +8,8 @@
 #include "Misc/AutomationTest.h"
 #include "Components/CharacterAudio/WandererCharacterAudioComponent.h"
 #include "Data/Audio/WandererCharacterAudioProfile.h"
+#include "Interfaces/Audio/AudioPlaybackService.h"
+#include "Tests/AutomationCommon.h"
 #include "Tests/AutomationEditorCommon.h"
 #include "UObject/UnrealType.h"
 #include "Wwise/API/WwiseSoundEngineAPI.h"
@@ -124,6 +126,74 @@ bool FNativeSurfaceSwitchTest::RunTest(const FString& Parameters)
     Property->SetObjectPropertyValue_InContainer(Audio, Profile);
     if (!TestTrue(TEXT("Native profile initializes"), Audio->InitializeAudio(Emitter))) { Actor->Destroy(); return false; }
     ADD_LATENT_AUTOMATION_COMMAND(FNativeSurfaceSwitchProbe(this, Audio, Emitter, Switches));
+    return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FNativeAudioBatchPreflightTest, "Wanderer.Audio.NativePhysicalSurface.BatchPreflight",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FNativeAudioBatchPreflightTest::RunTest(const FString& Parameters)
+{
+    auto* Engine = IWwiseSoundEngineAPI::Get();
+    if (!TestTrue(TEXT("Wwise query available"), FAkAudioDevice::IsInitialized() && Engine && Engine->Query))
+    {
+        return false;
+    }
+    auto* Table = LoadObject<UDataTable>(nullptr,
+        TEXT("/Game/Config/Audio/Characters/Generic/DT_FootstepSurface_Generic"));
+    const auto* Wood = Table ? Table->FindRow<FWandererCharacterAudioSwitchRow>(TEXT("wood"), TEXT("Batch")) : nullptr;
+    const auto* Metal = Table ? Table->FindRow<FWandererCharacterAudioSwitchRow>(TEXT("metal"), TEXT("Batch")) : nullptr;
+    if (!TestTrue(TEXT("Two distinct surface switch values"), Wood && Metal && Wood->SwitchValue && Metal->SwitchValue
+        && Wood->SwitchValue->GetGroupID() == Metal->SwitchValue->GetGroupID()
+        && Wood->SwitchValue->GetShortID() != Metal->SwitchValue->GetShortID()))
+    {
+        return false;
+    }
+    UWorld* World = FAutomationEditorCommonUtils::CreateNewMap();
+    AActor* Actor = World->SpawnActor<AActor>();
+    UAkComponent* Emitter = NewObject<UAkComponent>(Actor);
+    Actor->AddInstanceComponent(Emitter);
+    Actor->SetRootComponent(Emitter);
+    Emitter->RegisterComponent();
+
+    FPreparedAudioAction WoodAction;
+    WoodAction.ActionID = TEXT("Wood");
+    WoodAction.Type = EWandererAudioActionType::SetSwitch;
+    WoodAction.TargetWeakPtr = Emitter;
+    WoodAction.AssetWeakPtr = Wood->SwitchValue.Get();
+    FPreparedAudioAction MetalAction = WoodAction;
+    MetalAction.ActionID = TEXT("Metal");
+    MetalAction.AssetWeakPtr = Metal->SwitchValue.Get();
+    const FPreparedAudioAction ValidBatch[] = {MetalAction, WoodAction};
+    bool bAttempted = false;
+    const auto Sent = WandererAudioPlayback::ApplyPreparedActions(*World, ValidBatch, bAttempted);
+    TestTrue(TEXT("Valid batch submitted"), bAttempted);
+    TestEqual(TEXT("Both commands accepted"), Sent.AcceptedAudioActions, 2);
+
+    FPreparedAudioAction InvalidAction = WoodAction;
+    InvalidAction.ActionID = TEXT("MissingTarget");
+    InvalidAction.TargetWeakPtr.Reset();
+    const FPreparedAudioAction InvalidBatch[] = {MetalAction, InvalidAction};
+    const auto Rejected = WandererAudioPlayback::ApplyPreparedActions(*World, InvalidBatch, bAttempted);
+    TestFalse(TEXT("Full preflight prevents command submission"), bAttempted);
+    TestEqual(TEXT("No side effects accepted"), Rejected.AcceptedAudioActions, 0);
+    ADD_LATENT_AUTOMATION_COMMAND(FWaitLatentCommand(0.2f));
+    ADD_LATENT_AUTOMATION_COMMAND(FFunctionLatentCommand(
+        [this, EmitterWeakPtr = TWeakObjectPtr<UAkComponent>(Emitter),
+            GroupID = Wood->SwitchValue->GetGroupID(), WoodID = Wood->SwitchValue->GetShortID()]
+        {
+            UAkComponent* Target = EmitterWeakPtr.Get();
+            auto* SoundEngine = IWwiseSoundEngineAPI::Get();
+            if (TestTrue(TEXT("World and query still available"), Target && SoundEngine && SoundEngine->Query))
+            {
+                AkSwitchStateID Applied = 0;
+                TestEqual(TEXT("Read applied surface switch"),
+                    SoundEngine->Query->GetSwitch(GroupID, Target->GetAkGameObjectID(), Applied), AK_Success);
+                TestEqual(TEXT("Commands keep their order and the rejected batch leaves the prior value"), Applied, WoodID);
+                Target->GetOwner()->Destroy();
+            }
+            return true;
+        }));
     return true;
 }
 #endif

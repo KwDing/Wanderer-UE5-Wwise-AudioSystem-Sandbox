@@ -1,15 +1,14 @@
 #include "Framework/WandererPlayerController.h"
 
 #include "Components/SkeletalMeshComponent.h"
+#include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
-#include "UObject/ConstructorHelpers.h"
-
-#include "AkAudioEvent.h"
-
+#include "Data/Audio/WandererUIAudioSettings.h"
 #include "Interfaces/SwimmingStateProvider.h"
 #include "Systems/Audio/ListenerAudioManager.h"
+#include "Systems/Audio/WandererUIAudioSubsystem.h"
 
 namespace
 {
@@ -61,14 +60,17 @@ void AWandererPlayerController::PlayerTick(float DeltaSeconds)
     }
 }
 
-void AWandererPlayerController::InitializeAudioDefaults()
+void AWandererPlayerController::PrepareLocalAudio()
 {
-    static ConstructorHelpers::FObjectFinder<UAkAudioEvent> PauseEvent(
-        TEXT("/Game/WwiseAudio/Events/UI/Pause_Menu_SFX"));
-    static ConstructorHelpers::FObjectFinder<UAkAudioEvent> ResumeEvent(
-        TEXT("/Game/WwiseAudio/Events/UI/Resume_Menu_SFX"));
-    MenuPauseEvent = PauseEvent.Object;
-    MenuResumeEvent = ResumeEvent.Object;
+    const auto* Settings = GetDefault<UWandererUIAudioSettings>();
+    ListenerAudioManager->PrepareMenuEvents(Settings->MenuPauseEvent, Settings->MenuResumeEvent);
+    if (UGameInstance* Instance = GetGameInstance())
+    {
+        if (auto* UIAudio = Instance->GetSubsystem<UWandererUIAudioSubsystem>())
+        {
+            UIAudio->PreloadConfiguredProfiles();
+        }
+    }
 }
 
 void AWandererPlayerController::UpdateUnderwaterAudio()
@@ -114,6 +116,6 @@ void AWandererPlayerController::SetMenuAudioDucking(EWandererPlayState PlayState
     const EListenerMenuMode Mode = PlayState == EWandererPlayState::PauseMenu
         ? EListenerMenuMode::Paused : PlayState == EWandererPlayState::UI
         ? EListenerMenuMode::Focused : EListenerMenuMode::Closed;
-    ListenerAudioManager->SetMenuState(Mode, MenuPauseEvent, MenuResumeEvent);
+    ListenerAudioManager->SetMenuMode(Mode);
 }
 

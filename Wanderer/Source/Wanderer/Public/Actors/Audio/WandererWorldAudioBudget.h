@@ -4,6 +4,7 @@
 #include "GameFramework/Info.h"
 #include "Data/Audio/WorldAudioBudgetData.h"
 #include "Interfaces/Audio/AudioBudgetProvider.h"
+#include "Types/Audio/AudioSchedulingTypes.h"
 #include "WandererWorldAudioBudget.generated.h"
 
 /** One per persistent map. Soft UE admission limits, not Wwise physical voices. */
@@ -13,6 +14,15 @@ class WANDERER_API AWandererWorldAudioBudget : public AInfo, public IAudioBudget
     GENERATED_BODY()
 
   public:
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Emitter Pool", meta = (ClampMin = "1"))
+    int32 RegularSlots = AudioSchedulingDefaults::RegularSlots;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Emitter Pool", meta = (ClampMin = "0"))
+    int32 TransitionSlots = AudioSchedulingDefaults::TransitionSlots;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Emitter Pool", meta = (ClampMin = "0"))
+    int32 EmergencySlots = AudioSchedulingDefaults::EmergencySlots;
+
     UPROPERTY(EditAnywhere,
         BlueprintReadWrite,
         Category = "Audio Resources",
